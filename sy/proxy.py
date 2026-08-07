@@ -422,6 +422,7 @@ async def proxy_responses(
                     ):
                         buf = bytearray()
                         stream_error = None
+                        client_disconnect = False
                         first_ms = None
                         try:
                             async for chunk in r.aiter_raw():
@@ -452,11 +453,7 @@ async def proxy_responses(
                                 for ev in conv.finalize():
                                     yield ev.encode("utf-8")
                         except asyncio.CancelledError:
-                            stream_error = "client disconnected before stream completed"
-                            try:
-                                yield conv.failed_event(stream_error, "client_disconnect").encode("utf-8")
-                            except Exception:
-                                pass
+                            client_disconnect = True
                             raise
                         except Exception as e:
                             stream_error = f"stream aborted: {e}"
@@ -468,17 +465,15 @@ async def proxy_responses(
                             await r.aclose()
                             await c.aclose()
                             stream_err_log_id = None
-                            if stream_error or not conv.is_completed():
-                                reason = stream_error or "stream ended without response.completed"
-                                stream_err_log_id = record_error(
-                                    status=r.status_code,
-                                    error=reason,
-                                    attempts=list(errors),
-                                )
-                            if not conv.is_completed():
-                                status = 499
-                            else:
-                                status = r.status_code
+                            if not client_disconnect:
+                                if stream_error or not conv.is_completed():
+                                    reason = stream_error or "stream ended without response.completed"
+                                    stream_err_log_id = record_error(
+                                        status=r.status_code,
+                                        error=reason,
+                                        attempts=list(errors),
+                                    )
+                            status = r.status_code
                             usage = conv.latest_usage or logbook._extract_usage(bytes(buf))
                             record(
                                 status=status,
@@ -567,6 +562,7 @@ async def proxy_responses(
                 ):
                     buf = bytearray()
                     stream_error = None
+                    client_disconnect = False
                     first_ms = None
                     try:
                         async for chunk in r.aiter_raw():
@@ -577,7 +573,7 @@ async def proxy_responses(
                                     buf.extend(chunk)
                                 yield chunk
                     except asyncio.CancelledError:
-                        stream_error = "client disconnected before stream completed"
+                        client_disconnect = True
                         raise
                     except Exception as e:
                         stream_error = f"stream aborted: {e}"
@@ -586,16 +582,13 @@ async def proxy_responses(
                         await r.aclose()
                         await c.aclose()
                         stream_err_log_id = None
-                        if stream_error:
+                        if stream_error and not client_disconnect:
                             stream_err_log_id = record_error(
                                 status=r.status_code,
                                 error=stream_error,
                                 attempts=list(errors),
                             )
-                        if stream_error:
-                            status = 499
-                        else:
-                            status = r.status_code
+                        status = r.status_code
                         record(
                             status=status,
                             upstream=up.get("name"),
