@@ -681,6 +681,10 @@ code { font-size: 0.85em; padding: 1px 5px; border-radius: 5px; background: rgba
 .attempt-card { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; margin-bottom: 8px; background: var(--surface-2); font-size: 0.8rem; }
 .attempt-card .attempt-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
 .attempt-card .attempt-body { color: var(--muted); white-space: pre-wrap; word-break: break-all; max-height: 180px; overflow: auto; font-family: var(--font-mono); font-size: 0.72rem; }
+.err-collapse-wrap { position: relative; }
+.attempt-body.err-collapse { max-height: 96px; overflow: hidden; }
+.attempt-body.err-collapse.expanded { max-height: none; overflow: auto; }
+.err-collapse-toggle { margin-top: 6px; }
 .failover-yes { color: var(--ok); }
 .failover-no { color: var(--danger); }
 

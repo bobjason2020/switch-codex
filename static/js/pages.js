@@ -332,6 +332,29 @@
       try { return JSON.stringify(body, null, 2); } catch { return String(body); }
     }
 
+    function collapsibleError(text) {
+      const s = String(text || "");
+      const escaped = escapeHtml(s);
+      if (s.length <= 600 && s.split("\n").length <= 10) {
+        return `<div class="attempt-body">${escaped}</div>`;
+      }
+      const id = "errclp" + Math.random().toString(36).slice(2, 8);
+      return `<div class="err-collapse-wrap">
+        <div class="attempt-body err-collapse collapsed" id="${id}">${escaped}</div>
+        <button type="button" class="btn-ghost btn-sm err-collapse-toggle" data-target="${id}">展开</button>
+      </div>`;
+    }
+
+    document.addEventListener("click", (ev) => {
+      const btn = ev.target && ev.target.closest ? ev.target.closest(".err-collapse-toggle") : null;
+      if (!btn) return;
+      const target = document.getElementById(btn.dataset.target || "");
+      if (!target) return;
+      const expanded = target.classList.toggle("expanded");
+      target.classList.toggle("collapsed", !expanded);
+      btn.textContent = expanded ? "收起" : "展开";
+    });
+
     function attemptCard(a, i) {
       const st = a.status == null
         ? '<span class="pill off">ERR</span>'
@@ -351,7 +374,7 @@
           ${cap}
         </div>
         ${a.url ? `<div class="muted">${escapeHtml(a.url)}</div>` : ""}
-        ${a.error ? `<div class="attempt-body">${escapeHtml(a.error)}</div>` : ""}
+        ${a.error ? collapsibleError(a.error) : ""}
       </div>`;
     }
 
@@ -374,7 +397,7 @@
           </div>
           <div class="err-section">
             <h4>错误信息</h4>
-            <div class="attempt-body">${escapeHtml(e.error || "")}</div>
+            ${collapsibleError(e.error || "")}
           </div>
           <div class="err-section">
             <h4>上游尝试记录（${(e.attempts || []).length}）</h4>
