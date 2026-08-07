@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Backups / local patch leftovers
+*.bak*
+*.orig*
+*~
+
+# Runtime logs
+logs/
+
+# Local state & secrets (upstream API keys, master key, request history, codex backup)
+data/
+
+# One-off local maintenance script (not part of the public project)
+scripts/backfill_interrupted_streams.py
