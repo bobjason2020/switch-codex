@@ -60,6 +60,8 @@ Key 仍在上游配置里，**不会**写入 `experimental_bearer_token`。
 - **本机原配置**：恢复项目介入前的 `~/.claude/settings.json` 快照，Claude Code 直连原 provider；
 - **openai-all**：把 `ANTHROPIC_BASE_URL` 指向本路由，模型走 `openai-all` 池；
 - **DeepSeek slug**：同上，但模型走对应 DeepSeek 池。
+- **auto-mode-bridge 集成**：应用 `openai-all` / DeepSeek 模式时自动安装本地 PreToolUse hook（`~/.claude/auto-mode-bridge/classifier.py`），替代 Anthropic 服务端 auto 分类器（DeepSeek 后端没有服务端分类器）。规则文件为 `~/.claude/auto-mode-bridge/rules.json`，仅在首次安装时从 `sy/bridge/` 拷贝，之后**永不覆盖用户修改**。选择「本机原配置」还原时，hook 注册随快照恢复一并移除（bridge 目录保留）；也可在 UI 手动开关（Claude Code 卡片里的勾选框）。修改后需 **新开 Claude Code 会话** 生效。
+- **fail-open 策略**：hook 三层判定 fail-open——deny 规则 → allow 规则 → LLM 兜底（LLM 兜底自动走本路由 `/v1/messages`，低 effort 分类）；兜底遇 5xx 或超时一律放行。
 
 上游可在「支持 Anthropic 原生 /messages」开关开启后，把 Claude Code 请求以
 Anthropic 格式直接透传（零转换）；未开启的上游走 Anthropic → Responses 转换层，
@@ -86,6 +88,7 @@ sy/
   proxy.py              # /v1/responses、/v1/messages 透传/转换与 failover
   anthropic.py          # Anthropic Messages ↔ Responses 转换（含流式）
   claude_sync.py        # Claude Code settings.json 快照/恢复
+  bridge/               # vendored claude-auto-mode-bridge（MIT，classifier.py + rules.json + LICENSE，纯拷贝不改）
   api.py                # 管理 API 路由
 static/
   index.html            # 页面壳子（侧边栏 + 顶栏 + hash 路由）

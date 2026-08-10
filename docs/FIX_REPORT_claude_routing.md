@@ -23,6 +23,7 @@
 - P1-6：`stream=true` 但上游回 JSON 时，合成完整 Anthropic SSE 下发。
 - P2-7 ~ P2-10、P3-11 ~ P3-15：model 一致性、mode 400 校验、JS 注册位置、reasoning 双计、死字段、escapeHtml、endpoint 一致性、`_parse_usage` 兜底、README 均已处理。
 - 请求日志新增 `session_id`（Claude Code 的 `x-claude-code-session-id` / metadata.session_id，Responses 客户端的 session_id 头），同一会话稳定不变；日志表把“上游”与“端口”合并为一列（上游名称 + 端口徽标）。
+- auto-mode-bridge hook 已集成进 claude_sync（DeepSeek 后端无服务端 auto 分类器的本地替代，fail-open）。
 
 未做（后续可选项）：熔断器状态机、thinking signature 整流、模型级 media 整流——这些属于增强，不阻塞 Claude Code 基本可用。
 
