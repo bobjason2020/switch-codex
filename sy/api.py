@@ -116,6 +116,10 @@ class ClaudeConfigIn(BaseModel):
     model: Optional[str] = Field(None, min_length=1)
 
 
+class ClaudeBridgeIn(BaseModel):
+    enabled: bool
+
+
 class ModelProbeIn(BaseModel):
     model: str = Field(..., min_length=1)
     probe_enabled: bool
@@ -196,6 +200,11 @@ async def set_active_model(body: ActiveModelIn, _: str = Depends(auth.require_ma
 @router.put("/api/claude/config")
 async def set_claude_config(body: ClaudeConfigIn, _: str = Depends(auth.require_master)):
     return core._apply_claude_config(body.mode, body.model)
+
+
+@router.put("/api/claude/bridge")
+async def set_claude_bridge(body: ClaudeBridgeIn, _: str = Depends(auth.require_master)):
+    return core._apply_claude_bridge(body.enabled)
 
 
 @router.get("/api/models")

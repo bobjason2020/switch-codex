@@ -788,6 +788,15 @@
           (mode ? "当前模式：" + text : "未介入配置") +
           (st.applied_at ? " · 最近应用 " + fmtTs(st.applied_at) : "");
       }
+      const tgl = $("bridgeToggle");
+      if (tgl) tgl.checked = !!(st.bridge && st.bridge.installed);
+      const info = $("bridgeInfo");
+      if (info) {
+        if (!st.bridge) info.textContent = "";
+        else if (st.bridge.installed)
+          info.textContent = "hook 已装" + (st.bridge.rules_present ? "" : " · rules.json 缺失") + (st.bridge.command ? " · " + st.bridge.command : "");
+        else info.textContent = "hook 未安装";
+      }
     }
 
     $("btnApplyClaude").onclick = async () => {
@@ -809,6 +818,22 @@
         renderClaudeStatus();
         await refreshModels();
       } catch (e) { showMsg(e.message, false); }
+    };
+
+    $("bridgeToggle").onchange = async () => {
+      const tgl = $("bridgeToggle");
+      const target = tgl.checked;
+      try {
+        showMsg("正在" + (target ? "安装" : "移除") + " auto-mode hook …", true);
+        const r = await api("/api/claude/bridge", { method: "PUT", body: JSON.stringify({ enabled: target }) });
+        claudeStatus = r.claude || claudeStatus || {};
+        renderClaudeStatus();
+        const changes = (r.changes || []).map((x) => "· " + x).join("\n");
+        showMsg((target ? "已安装 auto-mode hook" : "已移除 auto-mode hook") + "\n" + changes + "\n请新开 Claude Code 会话生效。", true);
+      } catch (e) {
+        tgl.checked = !target; // 失败回滚
+        showMsg(e.message, false);
+      }
     };
 
     $("btnApplyActive").onclick = async () => {

@@ -963,6 +963,31 @@ def _apply_claude_config(mode: str, model: Optional[str] = None) -> dict[str, An
     }
 
 
+def _apply_claude_bridge(enabled: bool) -> dict[str, Any]:
+    """启停 Claude auto-mode-bridge PreToolUse hook。
+
+    仿 _apply_claude_config 的 try/except 风格：失败抛 HTTPException 500
+    （detail 为中文信息，如 "auto-mode-bridge hook 配置失败: {e}"），
+    成功返回 {"enabled", "changes", "claude"}。
+    """
+    try:
+        if enabled:
+            changes = claude_sync.install_hook()
+        else:
+            changes = claude_sync.uninstall_hook()
+    except Exception as e:
+        log.exception("claude auto-mode-bridge hook config failed enabled=%s", enabled)
+        raise HTTPException(
+            status_code=500,
+            detail=f"auto-mode-bridge hook 配置失败: {e}",
+        ) from e
+    return {
+        "enabled": bool(enabled),
+        "changes": list(changes),
+        "claude": claude_sync.status(),
+    }
+
+
 def _price_color_for_multiplier(mult: Optional[float]) -> Optional[str]:
     """倍率 → 颜色：0.03 深绿 → 0.20+ 亮黄。"""
     if mult is None:

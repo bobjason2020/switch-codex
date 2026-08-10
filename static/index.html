@@ -386,6 +386,16 @@
             <span class="muted" id="claudeModelLabel"></span>
           </div>
           <p class="muted" id="claudeChanges" style="font-size:0.8rem;margin-top:8px"></p>
+          <div class="codex-sync-status">
+            <label class="hint" style="margin-right:8px">
+              <input type="checkbox" id="bridgeToggle" style="margin-right:4px" />auto-mode 本地分类 hook
+            </label>
+            <span class="muted" id="bridgeInfo"></span>
+          </div>
+          <p class="hint" style="margin-top:8px">
+            auto-mode-bridge 用本地规则 + LLM 兜底替代 Anthropic 服务端分类器：应用 openai-all/deepseek 模式时自动安装
+            PreToolUse hook，还原本机原配置时自动移除；也可在此手动开关。请新开 Claude Code 会话生效。
+          </p>
         </div>
       </div>
 
