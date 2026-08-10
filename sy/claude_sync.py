@@ -10,6 +10,10 @@ Claude Code 会把 settings.json 中 env 键的内容注入为环境变量；本
 MANAGED_ENV_KEYS 列出的键，settings.json 的其它内容（顶层键、其它 env 键）原样保留。
 路由的 Anthropic base URL 不带 /v1（Claude Code 会自动拼接 /v1/messages），
 认证 token 为路由 master key（客户端与 4100 用同一把 key）。
+
+本模块还负责 claude-auto-mode-bridge 的 PreToolUse hook 安装/卸载：
+hook 文件落在 claude_home()/auto-mode-bridge，随 env 应用一并安装，
+随快照恢复仅移除 settings.json 中的注册（bridge 目录保留，rules.json 可能有用户修改）。
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -49,6 +54,10 @@ MANAGED_ENV_KEYS = (
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "CLAUDE_CODE_SUBAGENT_MODEL",
 )
+
+# claude-auto-mode-bridge：PreToolUse hook 的 vendored 源与目标目录名
+BRIDGE_SRC = ROUTER_ROOT / "sy" / "bridge"
+BRIDGE_DIR_NAME = "auto-mode-bridge"
 
 
 def _router_anthropic_base() -> str:
@@ -134,6 +143,137 @@ def _write_settings(obj: dict) -> None:
     p = settings_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write(p, json.dumps(obj, ensure_ascii=False, indent=2) + "\n")
+
+
+def _bridge_dir() -> Path:
+    """auto-mode-bridge 目录：claude_home()/auto-mode-bridge（尊重 CLAUDE_CONFIG_DIR）。"""
+    return claude_home() / BRIDGE_DIR_NAME
+
+
+def _hook_command() -> str:
+    """PreToolUse hook 的 command：sys.executable + classifier.py 绝对路径（反斜杠换 /）。"""
+    return f"{sys.executable} {_bridge_dir() / 'classifier.py'}".replace("\\", "/")
+
+
+def _bridge_installed() -> bool:
+    """settings.json 是否已注册 auto-mode-bridge 的 PreToolUse hook。
+
+    任一 hooks.PreToolUse 条目（含 "hooks" 子列表的 dict）里的 command 含
+    "auto-mode-bridge" 子串即视为已安装；settings 缺失或读取异常按未安装处理。
+    """
+    try:
+        obj = _read_settings()
+    except Exception:
+        return False
+    hooks = obj.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    pre = hooks.get("PreToolUse")
+    if not isinstance(pre, list):
+        return False
+    for entry in pre:
+        if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+            continue
+        for h in entry["hooks"]:
+            if isinstance(h, dict) and "auto-mode-bridge" in str(h.get("command", "")):
+                return True
+    return False
+
+
+def install_hook() -> list[str]:
+    """安装 auto-mode-bridge 的 PreToolUse hook（幂等，返回中文变更报告）。
+
+    classifier.py 总是跟随 vendored 更新拷贝；rules.json / LICENSE 仅目标缺失时
+    拷贝（不覆盖用户修改）。settings.json 的 hooks.PreToolUse 先剔除所有含
+    auto-mode-bridge 的旧条目再追加新条目，其余键原样保留；无变化时不重写文件。
+    """
+    report: list[str] = []
+    dst_dir = _bridge_dir()
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    classifier_src = BRIDGE_SRC / "classifier.py"
+    classifier_dst = dst_dir / "classifier.py"
+    existed = classifier_dst.exists()
+    shutil.copy2(classifier_src, classifier_dst)
+    report.append("更新 classifier.py" if existed else "拷贝 classifier.py")
+
+    for name in ("rules.json", "LICENSE"):
+        dst = dst_dir / name
+        if not dst.exists():
+            shutil.copy2(BRIDGE_SRC / name, dst)
+            report.append(f"首次拷贝 {name}")
+
+    obj = _read_settings()
+    hooks = obj.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+        obj["hooks"] = hooks
+    pre = hooks.get("PreToolUse")
+    if not isinstance(pre, list):
+        pre = []
+        hooks["PreToolUse"] = pre
+
+    new_command = _hook_command()
+    new_entry = {"matcher": "*", "hooks": [{"type": "command", "command": new_command, "timeout": 15}]}
+
+    def _is_bridge_entry(entry: Any) -> bool:
+        return (
+            isinstance(entry, dict)
+            and isinstance(entry.get("hooks"), list)
+            and any(
+                isinstance(h, dict) and "auto-mode-bridge" in str(h.get("command", ""))
+                for h in entry["hooks"]
+            )
+        )
+
+    bridge_entries = [e for e in pre if _is_bridge_entry(e)]
+    kept = [e for e in pre if not _is_bridge_entry(e)]
+    final = kept + [new_entry]
+    if final == pre:
+        report.append("hook 已就绪")
+        return report
+    hooks["PreToolUse"] = final
+    _write_settings(obj)
+    if bridge_entries:
+        report.append("移除旧 hook 条目")
+    report.append("安装 hook")
+    return report
+
+
+def uninstall_hook() -> list[str]:
+    """移除 settings.json 中 auto-mode-bridge 的 PreToolUse hook（不动 bridge 目录）。
+
+    只剔除含 auto-mode-bridge 的条目；PreToolUse 空列表时清理该键、
+    hooks 空 dict 一并清理，其余键原样保留。有变更才写文件。
+    返回中文变更报告；未安装时返回 []。
+    """
+    obj = _read_settings()
+    hooks = obj.get("hooks")
+    if not isinstance(hooks, dict):
+        return []
+    pre = hooks.get("PreToolUse")
+    if not isinstance(pre, list):
+        return []
+    kept: list[Any] = []
+    removed = False
+    for entry in pre:
+        if isinstance(entry, dict) and isinstance(entry.get("hooks"), list) and any(
+            isinstance(h, dict) and "auto-mode-bridge" in str(h.get("command", ""))
+            for h in entry["hooks"]
+        ):
+            removed = True
+            continue
+        kept.append(entry)
+    if not removed:
+        return []
+    if kept:
+        hooks["PreToolUse"] = kept
+    else:
+        hooks.pop("PreToolUse", None)
+    if not hooks:
+        obj.pop("hooks", None)
+    _write_settings(obj)
+    return ["移除 auto-mode-bridge hook"]
 
 
 def ensure_original_snapshot() -> dict:
@@ -225,6 +365,12 @@ def apply_openai_all() -> dict:
     """配置 Claude Code 走 4100 的 openai-all 池（Anthropic 兼容端点）。"""
     ensure_original_snapshot()
     changes = _apply_env(_managed_env(DEFAULT_MODEL))
+    hook_report: list[str] = []
+    try:
+        hook_report = install_hook()
+    except Exception:
+        log.warning("install auto-mode-bridge hook failed (env 已应用)", exc_info=True)
+    changes = changes + hook_report
     man = _load_manifest()
     man.update(
         {
@@ -247,6 +393,12 @@ def apply_deepseek(model_slug: str) -> dict:
     env_target = _managed_env(model_slug)
     env_target["CLAUDE_CODE_SUBAGENT_MODEL"] = model_slug
     changes = _apply_env(env_target)
+    hook_report: list[str] = []
+    try:
+        hook_report = install_hook()
+    except Exception:
+        log.warning("install auto-mode-bridge hook failed (env 已应用)", exc_info=True)
+    changes = changes + hook_report
     man = _load_manifest()
     man.update(
         {
@@ -281,6 +433,8 @@ def restore_local_original() -> dict:
             "不一致，拒绝恢复"
         )
     actions: list[str] = []
+    # 覆盖 settings.json 之前探测 hook 注册情况（只读，不触碰 bridge 目录）
+    had_hook = _bridge_installed()
     sp = settings_path()
     # 恢复前备份当前配置（restore 是全文件覆盖且不可逆），误恢复后仍可找回
     if sp.exists():
@@ -294,6 +448,10 @@ def restore_local_original() -> dict:
         if sp.exists():
             sp.unlink()
             actions.append("deleted settings.json (originally missing)")
+    # 快照恢复是整文件覆盖，settings.json 中的 hook 注册随之消失；
+    # bridge 目录保留（rules.json 可能有用户修改）
+    if had_hook:
+        actions.append("移除 hook（随快照恢复）")
     man = _load_manifest()
     man.update(
         {
@@ -336,6 +494,16 @@ def status() -> dict:
                 config_model = env.get("ANTHROPIC_MODEL")
     except Exception:
         log.warning("failed to read claude settings for status", exc_info=True)
+    try:
+        bridge = {
+            "installed": _bridge_installed(),
+            "command": _hook_command(),
+            "rules_present": (_bridge_dir() / "rules.json").exists(),
+            "bridge_dir": str(_bridge_dir()),
+        }
+    except Exception:
+        log.warning("failed to probe auto-mode-bridge for status", exc_info=True)
+        bridge = {}
     return {
         "claude_home": str(claude_home()),
         "settings_exists": sp.exists(),
@@ -344,4 +512,5 @@ def status() -> dict:
         "config_model": config_model,
         "backup_mode": man.get("mode"),
         "applied_at": man.get("applied_at"),
+        "bridge": bridge,
     }
