@@ -374,6 +374,24 @@ td[colspan] { text-align: center; color: var(--muted); padding: 34px 8px; }
 .cell-2l .box { margin-left: 8px; padding: 0 5px; border-radius: 4px; font-size: 0.7rem; white-space: nowrap; }
 .cell-2l .box.green { background: rgba(6, 78, 59, 0.4); color: #6ee7b7; border: 1px solid rgba(62, 207, 142, 0.25); }
 .cell-2l .box.blue { background: rgba(30, 58, 95, 0.5); color: #93c5fd; border: 1px solid rgba(111, 168, 254, 0.3); }
+/* session-id 配色：10 色循环，低透明度，色相间差尽量大（session 列 td 无 cell-2l，独立作用域） */
+.box.sid-0, .box.sid-1, .box.sid-2, .box.sid-3, .box.sid-4,
+.box.sid-5, .box.sid-6, .box.sid-7, .box.sid-8, .box.sid-9 {
+  margin-left: 8px; padding: 0 5px; border-radius: 4px;
+  font-size: 0.7rem; white-space: nowrap;
+}
+.box.sid-0 { background: rgba(255, 107, 107, 0.16); color: #ff9b9b; border: 1px solid rgba(255, 107, 107, 0.28); }
+.box.sid-1 { background: rgba(105, 219, 124, 0.16); color: #8ce99a; border: 1px solid rgba(105, 219, 124, 0.28); }
+.box.sid-2 { background: rgba(116, 192, 252, 0.16); color: #a5d8ff; border: 1px solid rgba(116, 192, 252, 0.28); }
+.box.sid-3 { background: rgba(255, 169, 77, 0.16); color: #ffc078; border: 1px solid rgba(255, 169, 77, 0.28); }
+.box.sid-4 { background: rgba(59, 201, 219, 0.16); color: #66d9e8; border: 1px solid rgba(59, 201, 219, 0.28); }
+.box.sid-5 { background: rgba(177, 151, 252, 0.16); color: #c8b6fa; border: 1px solid rgba(177, 151, 252, 0.28); }
+.box.sid-6 { background: rgba(255, 224, 102, 0.16); color: #ffe066; border: 1px solid rgba(255, 224, 102, 0.30); }
+.box.sid-7 { background: rgba(247, 131, 172, 0.16); color: #faa2c1; border: 1px solid rgba(247, 131, 172, 0.28); }
+.box.sid-8 { background: rgba(56, 217, 169, 0.16); color: #63e6be; border: 1px solid rgba(56, 217, 169, 0.28); }
+.box.sid-9 { background: rgba(169, 227, 75, 0.16); color: #c0eb75; border: 1px solid rgba(169, 227, 75, 0.28); }
+/* 分类器标签：灰色低透明度，置于 effort 旁 */
+.box.box-cls { margin-left: 6px; padding: 0 5px; border-radius: 4px; font-size: 0.7rem; white-space: nowrap; background: rgba(148, 148, 148, 0.14); color: #bdbdbd; border: 1px solid rgba(148, 148, 148, 0.25); }
 
 .tps-box {
   display: inline-block;

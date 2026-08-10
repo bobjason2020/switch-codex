@@ -174,6 +174,7 @@
       renderModelMap([]);
       $("enabled").checked = true;
       $("chatCompletions").checked = false;
+      $("anthropicMessages").checked = false;
       $("modelCustom").value = "";
       fillModelSelect($("modelSelect"), DEFAULT_MODEL);
       $("upstreamType").value = "openai-all";
@@ -193,6 +194,7 @@
       $("multiplier").value = u ? (u.multiplier ?? 1) : "";
       $("enabled").checked = u ? !!u.enabled : true;
       $("chatCompletions").checked = u ? !!u.chat_completions : false;
+      $("anthropicMessages").checked = u ? !!u.anthropic_messages : false;
       $("modelCustom").value = "";
       fillModelSelect($("modelSelect"), u ? (u.model || DEFAULT_MODEL) : DEFAULT_MODEL);
       let type = "custom";
@@ -338,6 +340,29 @@
       }
       activeModel = data.active_model || DEFAULT_MODEL;
       codexStatus = data.codex || {};
+      claudeStatus = data.claude || {};
       fillModelSelect($("activeModel"), activeModel, true);
       fillModelSelect($("modelSelect"), $("modelSelect").value || DEFAULT_MODEL);
+      fillClaudeModelSelect();
+      renderCodexStatus();
+      renderClaudeStatus();
+    }
+
+    function fillClaudeModelSelect() {
+      const sel = $("claudeModel");
+      if (!sel) return;
+      const opts = [];
+      for (const m of knownModels) {
+        if (m.startsWith("deepseek-")) opts.push(m);
+      }
+      const mode = claudeStatus.mode || "";
+      let cur = "local-direct";
+      if (mode === "openai-all") cur = "openai-all";
+      else if (mode === "deepseek") cur = claudeStatus.config_model || "deepseek-v4-flash";
+      const list = [["local-direct", "本机原配置"], ["openai-all", "openai-all"]];
+      for (const m of opts.sort()) list.push([m, m]);
+      if (!list.some((o) => o[0] === cur)) list.push([cur, cur]);
+      sel.innerHTML = list.map((o) =>
+        `<option value="${escapeHtml(o[0])}"${o[0] === cur ? " selected" : ""}>${escapeHtml(o[1])}</option>`
+      ).join("");
     }

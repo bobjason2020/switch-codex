@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 from fastapi import HTTPException
 
-from sy import codex_sync, db, state, timeutil
+from sy import claude_sync, codex_sync, db, state, timeutil
 from sy.const import (
     CACHE_PRIORITY_TTL_SEC,
     DEFAULT_CLIENT_MODELS,
@@ -869,6 +869,7 @@ def public_upstream(u: dict, health_map: Optional[dict[str, dict]] = None) -> di
         "multiplier": upstream_multiplier_value(u),
         "probe_enabled": upstream_probe_enabled(u),
         "chat_completions": bool(u.get("chat_completions", False)),
+        "anthropic_messages": bool(u.get("anthropic_messages", False)),
         "ratio_source": u.get("ratio_source") or None,
         "ratio_group": u.get("ratio_group") or None,
         "status": status,
@@ -919,6 +920,46 @@ def _apply_active_model(active: str) -> dict[str, Any]:
         "upstreams_in_scope": len(scoped),
         "codex": codex_result,
         "codex_status": codex_sync.status(),
+    }
+
+
+def _apply_claude_config(mode: str, model: Optional[str] = None) -> dict[str, Any]:
+    """Claude Code 配置同步：local-direct / openai-all / deepseek 三种模式。
+
+    deepseek 模式要求 model 为 DeepSeek slug；openai-all/deepseek 会把
+    active_model 同步进配置（保证 /v1/messages 按该模型路由），local-direct
+    直连本机原端点、不动 active_model。
+    """
+    m = (mode or "").strip()
+    if m not in ("local-direct", "openai-all", "deepseek"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"未知 Claude 模式 {m!r}（仅支持 local-direct / openai-all / deepseek）",
+        )
+    if m == "deepseek" and not codex_sync.is_deepseek_model(model or ""):
+        raise HTTPException(
+            status_code=400,
+            detail="deepseek 模式必须提供 DeepSeek 模型 slug（如 deepseek-v4-flash）",
+        )
+
+    try:
+        result = claude_sync.sync_for_mode(m, model)
+    except Exception as e:
+        log.exception("claude sync failed for mode=%s model=%s", m, model)
+        raise HTTPException(status_code=500, detail=f"Claude Code 配置同步失败: {e}") from e
+
+    active = normalize_model(load_config().get("active_model"))
+    if m in ("openai-all", "deepseek"):
+        target = (model or "").strip() or claude_sync.DEFAULT_MODEL
+        cfg = load_config()
+        cfg["active_model"] = target
+        save_config(cfg)
+        active = normalize_model(target)
+    return {
+        "mode": m,
+        "active_model": active,
+        "claude": claude_sync.status(),
+        "changes": result.get("changes") or result.get("actions") or [],
     }
 
 

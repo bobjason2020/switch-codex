@@ -194,11 +194,21 @@ async def _probe_upstream(
     request_model = core.upstream_request_model(target, probe_model)
     payload_model = request_model or probe_model
     chat_mode = bool(target.get("chat_completions"))
+    anthropic_mode = bool(target.get("anthropic_messages"))
     url = str(target.get("base_url") or "").rstrip("/") + (
-        "/chat/completions" if chat_mode else "/responses"
+        "/messages"
+        if anthropic_mode
+        else ("/chat/completions" if chat_mode else "/responses")
     )
     payload: dict[str, Any]
-    if chat_mode:
+    if anthropic_mode:
+        # Anthropic 原生上游：用 Messages 格式探测（x-api-key 认证）
+        payload = {
+            "model": payload_model,
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "Reply exactly: OK"}],
+        }
+    elif chat_mode:
         payload = {
             "model": payload_model,
             "messages": [
@@ -228,13 +238,18 @@ async def _probe_upstream(
     log_path = f"/api/upstreams/{uid}/test"
     t0 = time.perf_counter()
     try:
+        probe_headers = {
+            "Content-Type": "application/json",
+        }
+        if anthropic_mode:
+            probe_headers["x-api-key"] = target["api_key"]
+            probe_headers["anthropic-version"] = "2023-06-01"
+        else:
+            probe_headers["Authorization"] = f"Bearer {target['api_key']}"
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(
                 url,
-                headers={
-                    "Authorization": f"Bearer {target['api_key']}",
-                    "Content-Type": "application/json",
-                },
+                headers=probe_headers,
                 json=payload,
             )
         duration_ms = (time.perf_counter() - t0) * 1000.0

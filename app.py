@@ -72,7 +72,7 @@ async def health():
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html = (STATIC / "index.html").read_text(encoding="utf-8")
-    return HTMLResponse(html)
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 # SPA 路径路由兜底：/logs、/settings/pricing 等路径刷新时直接返回管理面板。
@@ -94,7 +94,7 @@ async def spa_fallback(path: str):
     full = "/" + path
     if full in _PAGE_PATHS:
         html = (STATIC / "index.html").read_text(encoding="utf-8")
-        return HTMLResponse(html)
+        return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
     raise HTTPException(status_code=404, detail="Not Found")
 
 

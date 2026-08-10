@@ -3,9 +3,7 @@
       const tip = attempts
         .map((a) => `${a.upstream || "?"}:${a.status == null ? "ERR" : a.status}`)
         .join(" → ");
-      const first = attempts[0] || {};
-      const label = `已切换 (${first.upstream || "?"} ${first.status == null ? "ERR" : first.status})`;
-      return `<span class="pill warn" title="失败尝试：${escapeHtml(tip)}">${escapeHtml(label)}</span>`;
+      return `<span class="pill warn" title="失败尝试：${escapeHtml(tip)}">已切换</span>`;
     }
 
     function statusPill(st, errorLogId, attempts) {
@@ -449,11 +447,12 @@
         Number(stats.total_input_tokens || 0) - Number(stats.total_cached_tokens || 0)
       );
       const cachedInput = Number(stats.total_cached_tokens || 0);
-      const output = Number(stats.total_output_tokens || 0) + Number(stats.total_reasoning_tokens || 0);
+      // output_tokens 已包含 reasoning/thinking，避免双计。
+      const output = Number(stats.total_output_tokens || 0);
       const tokenItems = [
         { label: "输入（未缓存）", value: uncachedInput },
         { label: "缓存读", value: cachedInput },
-        { label: "输出（含推理）", value: output },
+        { label: "输出", value: output },
       ];
       const upstreamCostItems = Object.entries(stats.upstream_breakdown || {}).map(([label, detail]) => ({
         label,

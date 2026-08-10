@@ -72,7 +72,17 @@ def _extract_usage(raw: bytes) -> Optional[dict]:
             return found
     except Exception:
         pass
-    best: Optional[dict] = None
+
+    # 流式 usage 在不同协议里被拆开：
+    # - Anthropic：message_start 带 input/cache，message_delta 只带 output；
+    # - Responses：response.completed 一次性给全量。
+    # 因此分别保留“最早见到的 input/cache”和“最后见到的 output”再合并，
+    # 不能像旧实现那样只取最后一个 usage（Anthropic 流会丢 input/cache）。
+    first_input: Optional[int] = None
+    first_cache_read: Optional[int] = None
+    first_cache_creation: Optional[int] = None
+    last_output: Optional[int] = None
+    last_full: Optional[dict] = None
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -87,8 +97,75 @@ def _extract_usage(raw: bytes) -> Optional[dict]:
             continue
         found = _find_usage_in_obj(obj)
         if found is not None:
-            best = found
-    return best
+            last_full = found
+            input_tokens = _token_int(found.get("input_tokens"))
+            if input_tokens is not None and first_input is None:
+                first_input = input_tokens
+            cache_read = _token_int(found.get("cache_read_input_tokens"))
+            if cache_read is not None and first_cache_read is None:
+                first_cache_read = cache_read
+            cache_creation = _token_int(found.get("cache_creation_input_tokens"))
+            if cache_creation is not None and first_cache_creation is None:
+                first_cache_creation = cache_creation
+            output_tokens = _token_int(found.get("output_tokens"))
+            if output_tokens is not None:
+                last_output = output_tokens
+
+    if last_full is None:
+        return None
+    merged = dict(last_full)
+    if first_input is not None:
+        merged["input_tokens"] = first_input
+    if first_cache_read is not None:
+        merged["cache_read_input_tokens"] = first_cache_read
+    if first_cache_creation is not None:
+        merged["cache_creation_input_tokens"] = first_cache_creation
+    if last_output is not None:
+        merged["output_tokens"] = last_output
+    return merged
+
+
+def _extract_session_id(headers: dict[str, str], body: dict) -> Optional[str]:
+    """从客户端请求里提取会话 id（借鉴 cc-switch proxy/session.rs）。
+
+    优先级：
+    1. 头部 x-claude-code-session-id / claude-code-session-id（Claude Code）；
+    2. 头部 session_id / x-session-id（Codex/Responses 类客户端）；
+    3. body.metadata.user_id（兼容 user_xxx_session_yyy 与 JSON 字符串）；
+    4. body.metadata.session_id。
+    """
+    for key in (
+        "x-claude-code-session-id",
+        "claude-code-session-id",
+        "session-id",
+        "x-session-id",
+        "session_id",
+    ):
+        value = (headers.get(key) or headers.get(key.lower()) or "").strip()
+        if value:
+            return value
+
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    user_id = metadata.get("user_id")
+    if isinstance(user_id, str) and user_id:
+        # cc-switch 老格式：user_xxx_session_yyy
+        if "_session_" in user_id:
+            return user_id.split("_session_", 1)[1]
+        # Claude Code 2.1.x 实测：user_id 是含 session_id 的 JSON 字符串
+        try:
+            parsed = json.loads(user_id)
+            if isinstance(parsed, dict):
+                sid = parsed.get("session_id")
+                if isinstance(sid, str) and sid:
+                    return sid
+        except Exception:
+            pass
+    sid = metadata.get("session_id")
+    if isinstance(sid, str) and sid:
+        return sid
+    return None
 
 
 def _usage_numbers(usage: Optional[dict]) -> dict[str, Optional[int]]:
@@ -96,13 +173,24 @@ def _usage_numbers(usage: Optional[dict]) -> dict[str, Optional[int]]:
     detail_in = usage.get("input_tokens_details") or {}
     detail_out = usage.get("output_tokens_details") or {}
     input_tokens = _token_int(usage.get("input_tokens"))
-    cached_tokens = (
-        _token_int(detail_in.get("cached_tokens")) if isinstance(detail_in, dict) else None
-    )
+    # 缓存：Anthropic 风格（cache_read_input_tokens / cache_creation_input_tokens），
+    # 或 OpenAI 风格 input_tokens_details.cached_tokens。
+    # 注意语义差异：Anthropic 的 input_tokens 同时排除 cache_read 与
+    # cache_creation（两者都是额外量）；而前端用 uncached = input - cached
+    # 展示，因此这里把两者都加回总输入，缓存量 = cache_read + cache_creation。
+    cached_tokens = None
+    cache_read = _token_int(usage.get("cache_read_input_tokens"))
+    cache_creation = _token_int(usage.get("cache_creation_input_tokens"))
+    if cache_read is not None or cache_creation is not None:
+        cached_tokens = (cache_read or 0) + (cache_creation or 0)
+        input_tokens = (input_tokens or 0) + (cache_read or 0) + (cache_creation or 0)
+    elif isinstance(detail_in, dict):
+        cached_tokens = _token_int(detail_in.get("cached_tokens"))
     output_tokens = _token_int(usage.get("output_tokens"))
-    reasoning_tokens = (
-        _token_int(detail_out.get("reasoning_tokens")) if isinstance(detail_out, dict) else None
-    )
+    # 思考：Anthropic/DeepSeek 可能顶层直接给 reasoning_tokens，OpenAI 风格在 details 里。
+    reasoning_tokens = _token_int(usage.get("reasoning_tokens"))
+    if reasoning_tokens is None and isinstance(detail_out, dict):
+        reasoning_tokens = _token_int(detail_out.get("reasoning_tokens"))
     total = _token_int(usage.get("total_tokens"))
     if total is None and (input_tokens is not None or output_tokens is not None):
         total = (input_tokens or 0) + (output_tokens or 0)
@@ -136,11 +224,18 @@ def _record_log(**fields: Any) -> None:
     if multiplier is None:
         multiplier = core.upstream_multiplier_for(upstream)
     is_probe = bool(fields.pop("is_probe", False))
+    path = fields.pop("path", "/v1/responses")
+    # 端口/协议标识：anthropic（/v1/messages）/ response（/v1/responses）/ chat（chat 转换上游）。
+    endpoint = fields.pop("endpoint", None) or (
+        "anthropic" if path == "/v1/messages" else "response"
+    )
     entry = {
         "ts": _iso_now(),
         "client_ip": fields.pop("client_ip", ""),
         "method": fields.pop("method", "POST"),
-        "path": fields.pop("path", "/v1/responses"),
+        "path": path,
+        "endpoint": endpoint,
+        "session_id": fields.pop("session_id", None),
         "pool": fields.pop("pool", ""),
         "client_model": fields.pop("client_model", None),
         "reasoning_effort": fields.pop("reasoning_effort", None),
@@ -159,6 +254,7 @@ def _record_log(**fields: Any) -> None:
         "total_tokens": _token_int(fields.pop("total_tokens", None)),
         "stream": bool(fields.pop("stream", False)),
         "is_probe": is_probe,
+        "is_classifier": bool(fields.pop("is_classifier", False)),
     }
     try:
         db.insert_request_log(entry)
@@ -343,9 +439,9 @@ def _aggregate_stats(items: list[dict], now: datetime) -> dict:
         d = e.get("duration_ms")
         if d is not None:
             try:
-                tps_tokens += int(e.get("reasoning_tokens") or 0) + int(
-                    e.get("output_tokens") or 0
-                )
+                # Anthropic/OpenAI 的 output_tokens 已包含 reasoning/thinking，
+                # 不再额外相加（借鉴 cc-switch TokenUsage 语义）。
+                tps_tokens += int(e.get("output_tokens") or 0)
                 tps_seconds += float(d) / 1000.0
             except (TypeError, ValueError):
                 pass

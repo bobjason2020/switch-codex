@@ -19,14 +19,15 @@
         const tb = $("recentBody");
         tb.innerHTML = "";
         if (!recent.data.length) {
-          tb.innerHTML = '<tr><td colspan="9" class="muted">暂无请求记录</td></tr>';
+          tb.innerHTML = '<tr><td colspan="10" class="muted">暂无请求记录</td></tr>';
         }
         for (const e of recent.data) {
           const tr = document.createElement("tr");
           tr.innerHTML = `
             <td class="mono">${fmtTs(e.ts)}</td>
             ${modelCell(e)}
-            <td>${escapeHtml(e.upstream || "")}</td>
+            ${upstreamCell(e)}
+            ${sessionIdCell(e)}
             <td>${statusPill(e.status, e.error_log_id, e.attempts)}</td>
             ${timeCell(e)}
             ${tpsCell(e)}
@@ -123,7 +124,7 @@
               await api("/api/upstreams/" + u.id, { method: "DELETE" });
               showMsg("已删除 " + u.name, true);
               await refreshModels();
-              await loadUpstreams();
+              await Promise.all([loadUpstreams(), loadOverview()]);
             } catch (e) { showMsg(e.message, false); }
           };
           tr.querySelector('[data-act="test"]').onclick = async () => {
@@ -165,14 +166,15 @@
         const tb = $("logBody");
         tb.innerHTML = "";
         if (!data.data.length) {
-          tb.innerHTML = '<tr><td colspan="9" class="muted">暂无请求日志</td></tr>';
+          tb.innerHTML = '<tr><td colspan="10" class="muted">暂无请求日志</td></tr>';
         }
         for (const e of data.data) {
           const tr = document.createElement("tr");
           tr.innerHTML = `
             <td class="mono">${fmtTs(e.ts)}</td>
             ${modelCell(e)}
-            <td>${escapeHtml(e.upstream || "")}</td>
+            ${upstreamCell(e)}
+            ${sessionIdCell(e)}
             <td>${statusPill(e.status, e.error_log_id, e.attempts)}</td>
             ${timeCell(e)}
             ${tpsCell(e)}
@@ -736,6 +738,79 @@
       } catch (e) { showMsg(e.message, false); }
     }
 
+    function renderCodexStatus() {
+      const pill = $("codexModePill");
+      if (!pill) return;
+      const st = codexStatus || {};
+      const mode = st.mode || "";
+      let text, cls;
+      if (mode === "local-direct") { text = "本机原配置"; cls = "ok"; }
+      else if (mode === "openai-all") { text = "openai-all（走 4100）"; cls = "ok"; }
+      else if (mode === "deepseek") { text = (st.config_model || "deepseek") + "（走 4100）"; cls = "ok"; }
+      else if (mode === "routing-only") { text = "仅路由（未改配置）"; cls = "disabled"; }
+      else { text = "未配置"; cls = ""; }
+      pill.className = "pill" + (cls ? " " + cls : "");
+      pill.textContent = text;
+      const label = $("codexModelLabel");
+      if (label) {
+        const m = st.config_model || st.provider || "";
+        label.textContent = m || "";
+      }
+      const changes = $("codexChanges");
+      if (changes) {
+        changes.textContent =
+          (mode ? "当前模式：" + text : "未介入配置") +
+          (st.applied_at ? " · 最近应用 " + fmtTs(st.applied_at) : "");
+      }
+    }
+
+    function renderClaudeStatus() {
+      const pill = $("claudeModePill");
+      if (!pill) return;
+      const st = claudeStatus || {};
+      const mode = st.mode || "";
+      let text, cls;
+      if (mode === "local-direct") { text = "本机原配置"; cls = "ok"; }
+      else if (mode === "openai-all") { text = "openai-all（走 4100）"; cls = "ok"; }
+      else if (mode === "deepseek") { text = (st.config_model || "deepseek") + "（走 4100）"; cls = "ok"; }
+      else { text = "未配置"; cls = ""; }
+      pill.className = "pill" + (cls ? " " + cls : "");
+      pill.textContent = text;
+      const label = $("claudeModelLabel");
+      if (label) {
+        label.textContent = st.settings_exists
+          ? "base: " + (st.config_base_url || "")
+          : "settings.json 不存在";
+      }
+      const changes = $("claudeChanges");
+      if (changes) {
+        changes.textContent =
+          (mode ? "当前模式：" + text : "未介入配置") +
+          (st.applied_at ? " · 最近应用 " + fmtTs(st.applied_at) : "");
+      }
+    }
+
+    $("btnApplyClaude").onclick = async () => {
+      const v = ($("claudeModel").value || "local-direct").trim();
+      const isDeepseek = v !== "local-direct" && v !== "openai-all";
+      const mode = v === "local-direct" ? "local-direct" : isDeepseek ? "deepseek" : "openai-all";
+      const payload = { mode };
+      if (mode === "deepseek") payload.model = v;
+      try {
+        showMsg("正在应用 Claude Code 配置 " + v + " …", true);
+        const r = await api("/api/claude/config", { method: "PUT", body: JSON.stringify(payload) });
+        claudeStatus = r.claude || {};
+        if (r.active_model) activeModel = r.active_model;
+        const changes = (r.changes || []).map((x) => "· " + x).join("\n");
+        const modeText =
+          mode === "local-direct" ? "已恢复本机原配置" :
+          mode === "openai-all" ? "已配置走 4100（openai-all 池）" : "已配置走 4100（" + v + " 池）";
+        showMsg("Claude Code：" + modeText + "\n" + changes + "\n请新开 Claude Code 会话使配置生效。", true);
+        renderClaudeStatus();
+        await refreshModels();
+      } catch (e) { showMsg(e.message, false); }
+    };
+
     $("btnApplyActive").onclick = async () => {
       const m = ($("activeModel").value || DEFAULT_MODEL).trim();
       try {
@@ -776,6 +851,7 @@
         priority: Number($("priority").value || 100),
         enabled: $("enabled").checked,
         chat_completions: $("chatCompletions").checked,
+        anthropic_messages: $("anthropicMessages").checked,
         model,
         model_map: collectModelMap(),
       };

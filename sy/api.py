@@ -10,7 +10,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from sy import auth, codex_sync, core, db, logbook, probes, state, timeutil
+from sy import auth, claude_sync, codex_sync, core, db, logbook, probes, state, timeutil
 from sy.const import (
     COLOR_BAD,
     DEFAULT_MODEL,
@@ -90,6 +90,7 @@ class UpstreamIn(BaseModel):
     multiplier: Optional[float] = Field(None, ge=0)
     probe_enabled: Optional[bool] = None
     chat_completions: Optional[bool] = None
+    anthropic_messages: Optional[bool] = None
 
 
 class UpstreamUpdate(BaseModel):
@@ -103,10 +104,16 @@ class UpstreamUpdate(BaseModel):
     multiplier: Optional[float] = Field(None, ge=0)
     probe_enabled: Optional[bool] = None
     chat_completions: Optional[bool] = None
+    anthropic_messages: Optional[bool] = None
 
 
 class ActiveModelIn(BaseModel):
     active_model: str = Field(..., min_length=1)
+
+
+class ClaudeConfigIn(BaseModel):
+    mode: str = Field(..., min_length=1)  # local-direct | openai-all | deepseek
+    model: Optional[str] = Field(None, min_length=1)
 
 
 class ModelProbeIn(BaseModel):
@@ -177,12 +184,18 @@ async def get_config(_: str = Depends(auth.require_master)):
         "host": cfg.get("host", "127.0.0.1"),
         "port": cfg.get("port", 4100),
         "codex": codex_sync.status(),
+        "claude": claude_sync.status(),
     }
 
 
 @router.put("/api/active-model")
 async def set_active_model(body: ActiveModelIn, _: str = Depends(auth.require_master)):
     return core._apply_active_model(body.active_model)
+
+
+@router.put("/api/claude/config")
+async def set_claude_config(body: ClaudeConfigIn, _: str = Depends(auth.require_master)):
+    return core._apply_claude_config(body.mode, body.model)
 
 
 @router.get("/api/models")
@@ -213,6 +226,7 @@ async def list_models(_: str = Depends(auth.require_master)):
         "active_model": core.normalize_model(cfg.get("active_model")),
         "probe_interval_sec": core.probe_interval_sec(cfg),
         "codex": codex_sync.status(),
+        "claude": claude_sync.status(),
     }
 
 
@@ -495,6 +509,7 @@ async def create_upstream(body: UpstreamIn, _: str = Depends(auth.require_master
         "multiplier": multiplier,
         "probe_enabled": probe_enabled,
         "chat_completions": bool(body.chat_completions),
+        "anthropic_messages": bool(body.anthropic_messages),
     }
     items.append(item)
     core.save_upstreams(items)
@@ -542,6 +557,8 @@ async def update_upstream(uid: str, body: UpstreamUpdate, _: str = Depends(auth.
                 u["probe_enabled"] = bool(data["probe_enabled"])
             if "chat_completions" in data and data["chat_completions"] is not None:
                 u["chat_completions"] = bool(data["chat_completions"])
+            if "anthropic_messages" in data and data["anthropic_messages"] is not None:
+                u["anthropic_messages"] = bool(data["anthropic_messages"])
             core.save_upstreams(items)
             return core.public_upstream(u)
     raise HTTPException(status_code=404, detail="upstream not found")
@@ -835,6 +852,9 @@ async def list_logs(
     )
     page = [_entry_in_beijing(e) for e in items]
     for e in page:
+        # 旧日志无 endpoint 字段：按路径兜底补全（anthropic / response）。
+        if not e.get("endpoint"):
+            e["endpoint"] = "anthropic" if (e.get("path") or "").startswith("/v1/messages") else "response"
         e["multiplier"] = core.entry_multiplier(e)
         e["cost_usd"] = core.compute_cost_usd(e)
         e["real_cost_cny"] = core.compute_real_cost_cny(e, e["cost_usd"], e["multiplier"])

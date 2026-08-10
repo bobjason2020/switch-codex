@@ -52,6 +52,23 @@ Key 仍在上游配置里，**不会**写入 `experimental_bearer_token`。
 
 切换模型后请 **新开 Codex 会话**。
 
+## Claude Code
+
+路由提供 Anthropic 兼容端点 `/v1/messages`（与 `/v1/responses` 共用同一套模型池、
+倍率、failover 与日志）。UI 的「Claude Code 配置」支持三种模式：
+
+- **本机原配置**：恢复项目介入前的 `~/.claude/settings.json` 快照，Claude Code 直连原 provider；
+- **openai-all**：把 `ANTHROPIC_BASE_URL` 指向本路由，模型走 `openai-all` 池；
+- **DeepSeek slug**：同上，但模型走对应 DeepSeek 池。
+
+上游可在「支持 Anthropic 原生 /messages」开关开启后，把 Claude Code 请求以
+Anthropic 格式直接透传（零转换）；未开启的上游走 Anthropic → Responses 转换层，
+再把响应转回 Anthropic 格式（支持流式与非流式，含 chat/completions 上游回退）。
+切换配置后请 **新开 Claude Code 会话**。
+
+注意：`~/.claude/settings.json` 由本路由管理；如果同时使用其它会改写该文件的工具
+（例如 cc-switch 的本地代理接管），请只保留一个写入方，避免配置互相覆盖。
+
 ## 代码结构
 
 后端拆成 `sy/` 包，前端拆成独立 JS 模块，不再有数千行单文件：
@@ -66,7 +83,9 @@ sy/
   logbook.py            # 请求/错误日志、统计、历史可用性时间线
   probes.py             # 模型级联探测 + NewAPI 倍率探测
   auth.py               # 管理登录会话与客户端 key
-  proxy.py              # /v1/responses 透传与 failover
+  proxy.py              # /v1/responses、/v1/messages 透传/转换与 failover
+  anthropic.py          # Anthropic Messages ↔ Responses 转换（含流式）
+  claude_sync.py        # Claude Code settings.json 快照/恢复
   api.py                # 管理 API 路由
 static/
   index.html            # 页面壳子（侧边栏 + 顶栏 + hash 路由）

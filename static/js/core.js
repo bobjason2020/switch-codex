@@ -9,6 +9,7 @@
     let modelCounts = {};
     let modelSync = {};
     let codexStatus = {};
+    let claudeStatus = {};
     let logOffset = 0;
     let logTotal = 0;
     let errOffset = 0;
@@ -187,12 +188,40 @@
     function modelCell(e) {
       const model = escapeHtml(e.client_model || "");
       const effort = e.reasoning_effort ? escapeHtml(e.reasoning_effort) : "";
-      if (!model && !effort) return "<td></td>";
-      if (!effort) return `<td class="mono">${model}</td>`;
+      const cls = e.is_classifier ? '<span class="box box-cls">分类器</span>' : "";
+      const line2 = [effort, cls].filter(Boolean).join(" ");
+      if (!model && !line2) return "<td></td>";
+      if (!line2) return `<td class="mono">${model}</td>`;
       return `<td class="mono">
         <div>${model}</div>
-        <div class="muted">${effort}</div>
+        <div class="muted">${line2}</div>
       </td>`;
+    }
+    function endpointBadge(ep) {
+      if (ep === "anthropic") return '<span class="box blue">Anthropic</span>';
+      if (ep === "chat") return '<span class="box green">chat</span>';
+      return '<span class="box">response</span>';
+    }
+    function upstreamCell(e) {
+      const up = escapeHtml(e.upstream || "");
+      const badge = endpointBadge(e.endpoint || "response");
+      if (!up) return `<td>${badge}</td>`;
+      return `<td class="mono">
+        <div>${up}</div>
+        <div class="muted">${badge}</div>
+      </td>`;
+    }
+    const sidColorMap = new Map();
+    function sessionIdCell(e) {
+      const sid = e.session_id || "";
+      if (!sid) return "<td></td>";
+      let idx = sidColorMap.get(sid);
+      if (idx === undefined) {
+        idx = sidColorMap.size % 10;
+        sidColorMap.set(sid, idx);
+      }
+      const short = sid.length > 20 ? sid.slice(0, 10) + "…" + sid.slice(-6) : sid;
+      return `<td class="mono" style="font-size:0.75rem" title="${escapeHtml(sid)}"><span class="box sid-${idx}">${escapeHtml(short)}</span></td>`;
     }
     function timeCell(e) {
       const hasTtft = hasValue(e.ttft_ms);
