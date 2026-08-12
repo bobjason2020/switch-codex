@@ -50,6 +50,20 @@ DEEPSEEK_CLIENT_MODELS = ("deepseek-v4-flash", "deepseek-v4-pro")
 DEEPSEEK_DEFAULT_MODEL_MAP = [
     {"model": m, "actual": m} for m in DEEPSEEK_CLIENT_MODELS
 ]
+# Grok 通用路由池 + 池下客户端模型（同 DeepSeek 的池/模型分层结构）
+GROK_POOL = "grok"
+GROK_CLIENT_MODELS = ("grok-4.6",)
+GROK_DEFAULT_MODEL_MAP = [
+    {"model": m, "actual": m} for m in GROK_CLIENT_MODELS
+]
+# grok-4.6 挂牌价（USD/1M）：NewAPI model_ratio=1 / completion=3 / cache=0.25
+GROK_DEFAULT_PRICING = {
+    "grok-4.6": {
+        "input_per_m": 2.0,
+        "output_per_m": 6.0,
+        "cache_read_per_m": 0.5,
+    }
+}
 DEFAULT_PROBE_INTERVAL_SEC = 300
 PROBE_MULTIPLIER_THRESHOLD = 0.1
 DEFAULT_CLIENT_MODELS = ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol")

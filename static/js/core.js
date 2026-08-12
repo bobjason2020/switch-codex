@@ -2,6 +2,8 @@
     const LOCAL_DIRECT = "local-direct";
     const DEEPSEEK_POOL = "deepseek";
     const DEEPSEEK_CLIENT_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"];
+    const GROK_POOL = "grok";
+    const GROK_CLIENT_MODELS = ["grok-4.6"];
     const PAGE_SIZE = 100;
     const $ = (id) => document.getElementById(id);
     const msg = $("msg");
@@ -13,6 +15,7 @@
     let modelSync = {};
     let codexStatus = {};
     let claudeStatus = {};
+    let grokStatus = {};
     let logOffset = 0;
     let logTotal = 0;
     let errOffset = 0;

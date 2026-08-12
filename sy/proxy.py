@@ -446,7 +446,7 @@ async def proxy_responses(
                         client_disconnect = False
                         first_ms = None
                         try:
-                            async for chunk in r.aiter_raw():
+                            async for chunk in r.aiter_bytes():
                                 if first_ms is None:
                                     first_ms = (time.perf_counter() - t0) * 1000.0
                                 if not chunk:
@@ -588,7 +588,7 @@ async def proxy_responses(
                     client_disconnect = False
                     first_ms = None
                     try:
-                        async for chunk in r.aiter_raw():
+                        async for chunk in r.aiter_bytes():
                             if first_ms is None:
                                 first_ms = (time.perf_counter() - t0) * 1000.0
                             if chunk:
@@ -1126,7 +1126,7 @@ async def proxy_anthropic_messages(
                             client_disconnect = False
                             first_ms = None
                             try:
-                                async for chunk in r.aiter_raw():
+                                async for chunk in r.aiter_bytes():
                                     if first_ms is None:
                                         first_ms = (time.perf_counter() - t0) * 1000.0
                                     if chunk:
@@ -1252,7 +1252,7 @@ async def proxy_anthropic_messages(
                         pending_line = ""
                         chat_finalized = False
                         try:
-                            async for chunk in r.aiter_raw():
+                            async for chunk in r.aiter_bytes():
                                 if first_ms is None:
                                     first_ms = (time.perf_counter() - t0) * 1000.0
                                 if not chunk:

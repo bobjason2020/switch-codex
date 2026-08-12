@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Switch-codex · Codex 调度站</title>
-  <link rel="stylesheet" href="/static/css/switchyard.css?v=20260810e" />
+  <link rel="stylesheet" href="/static/css/switchyard.css?v=20260812d" />
 </head>
 <body>
   <div class="app-shell">
@@ -145,6 +145,7 @@
           <h2>上游列表</h2>
           <button class="btn btn-sm" id="btnAddUpstream" type="button">＋ 添加上游</button>
         </div>
+        <div class="pool-switch" id="upstreamPoolSwitch" aria-label="按池筛选上游"></div>
         <div style="overflow-x:auto">
           <table>
             <thead>
@@ -341,7 +342,7 @@
 
     <section id="page-settings" class="page" style="display:none">
       <div class="sub-nav">
-        <button class="sub-nav-item active" data-sub="model" type="button">模型切换</button>
+        <button class="sub-nav-item active" data-sub="model" type="button">配置切换</button>
         <button class="sub-nav-item" data-sub="pricing" type="button">价格设置</button>
         <button class="sub-nav-item" data-sub="newapi" type="button">NewAPI 探测</button>
         <button class="sub-nav-item" data-sub="public" type="button">公网调用</button>
@@ -356,7 +357,7 @@
             <button class="btn" id="btnApplyActive" type="button">应用</button>
           </div>
           <p class="hint" style="margin-top:8px">
-            切换 Codex 客户端配置：openai / deepseek 自动写入 ~/.codex 走 4100，本机原配置恢复介入前快照。deepseek 为整体模式，models.json 内含 flash / pro，可在 Codex 内用 /model 切换。应用后请新开 Codex 会话生效。
+            openai / deepseek 走 4100（deepseek 含 flash / pro，/model 切换）。本机原配置可恢复，应用后新开会话。
           </p>
           <div class="codex-sync-status">
             <span class="pill" id="codexModePill">—</span>
@@ -364,8 +365,7 @@
           </div>
           <p class="muted" id="codexChanges" style="font-size:0.8rem;margin-top:8px"></p>
           <p class="hint" style="margin-top:12px">
-            模型可用性自动探测在总览页：每个整五分钟（:00 / :05 / :10…）按优先级（数字小优先）
-            级联探测，同优先级按倍率低→高；成功显示倍率与红绿灯（&lt;0.1 绿，≥0.1 黄，全失败红）。
+            可用性探测在总览页自动更新：绿 &lt;0.1、黄 ≥0.1、红全部失败。
           </p>
         </div>
 
@@ -377,9 +377,7 @@
             <button class="btn" id="btnApplyClaude" type="button">应用</button>
           </div>
           <p class="hint" style="margin-top:8px">
-            切换 Claude Code 客户端配置（写入 ~/.claude/settings.json 的 env）：
-            openai / deepseek 指向本路由 4100 的 Anthropic 兼容端点；deepseek 为整体池（含 flash / pro，用 /model 切换）；
-            本机原配置恢复介入前快照。应用后请新开 Claude Code 会话生效。
+            openai / deepseek 走 4100（deepseek 含 flash / pro，/model 切换）。本机原配置可恢复，应用后新开会话。
           </p>
           <div class="codex-sync-status">
             <span class="pill" id="claudeModePill">—</span>
@@ -393,9 +391,25 @@
             <span class="muted" id="bridgeInfo"></span>
           </div>
           <p class="hint" style="margin-top:8px">
-            auto-mode-bridge 用本地规则 + LLM 兜底替代 Anthropic 服务端分类器：应用 openai/deepseek 模式时自动安装
-            PreToolUse hook，还原本机原配置时自动移除；也可在此手动开关。请新开 Claude Code 会话生效。
+            应用 openai/deepseek 时自动装 hook，还原时自动移除。
           </p>
+        </div>
+
+        <!-- Grok 卡片 -->
+        <div class="card">
+          <h2>Grok 配置</h2>
+          <div class="active-row">
+            <select id="grokModel"></select>
+            <button class="btn" id="btnApplyGrok" type="button">应用</button>
+          </div>
+          <p class="hint" style="margin-top:8px">
+            grok 池走 4100。本机原配置可恢复，应用后新开会话。
+          </p>
+          <div class="codex-sync-status">
+            <span class="pill" id="grokModePill">—</span>
+            <span class="muted" id="grokModelLabel"></span>
+          </div>
+          <p class="muted" id="grokChanges" style="font-size:0.8rem;margin-top:8px"></p>
         </div>
       </div>
 
@@ -644,10 +658,11 @@
         <select id="upstreamType">
           <option value="openai">openai</option>
           <option value="deepseek">Deepseek</option>
+          <option value="grok">Grok</option>
           <option value="custom">自定义上游</option>
         </select>
         <p class="hint" id="typeHint">
-          openai / Deepseek 自动使用对应路由池，无需填写模型信息；自定义需选择或新建 Model 池。
+          openai / Deepseek / Grok 自动使用对应路由池，无需填写模型信息；自定义需选择或新建 Model 池。
         </p>
 
         <label>名称（请用英文，避免响应头 latin-1 问题）</label>
@@ -676,7 +691,8 @@
         <p class="hint">
           每行填「模型名 / 实际模型名」，实际模型名留空则与该模型名相同；
           未列入的模型不会使用该上游。列表为空会自动补回该池默认模型：
-          openai 带 gpt-5.6-luna / terra / sol，deepseek 带 deepseek-v4-flash / pro，其他池带池模型名。
+          openai 带 gpt-5.6-luna / terra / sol，deepseek 带 deepseek-v4-flash / pro，
+          grok 带 grok-4.6，其他池带池模型名。
         </p>
 
         <label>Base URL（含路径前缀，不要末尾斜杠）</label>
@@ -808,11 +824,11 @@
   </div>
 
 
-  <script src="/static/js/core.js?v=20260812b"></script>
-  <script src="/static/js/router.js?v=20260812b"></script>
-  <script src="/static/js/forms.js?v=20260812b"></script>
-  <script src="/static/js/overview.js?v=20260812b"></script>
-  <script src="/static/js/pages.js?v=20260812b"></script>
-  <script src="/static/js/app.js?v=20260812b"></script>
+  <script src="/static/js/core.js?v=20260812d"></script>
+  <script src="/static/js/router.js?v=20260812c"></script>
+  <script src="/static/js/forms.js?v=20260812c"></script>
+  <script src="/static/js/overview.js?v=20260812c"></script>
+  <script src="/static/js/pages.js?v=20260812d"></script>
+  <script src="/static/js/app.js?v=20260812c"></script>
 </body>
 </html>

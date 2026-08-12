@@ -10,7 +10,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from sy import auth, claude_sync, codex_sync, core, db, logbook, probes, state, timeutil
+from sy import auth, claude_sync, codex_sync, core, db, grok_sync, logbook, probes, state, timeutil
 from sy.const import (
     COLOR_BAD,
     DEFAULT_MODEL,
@@ -118,6 +118,11 @@ class ClaudeConfigIn(BaseModel):
     model: Optional[str] = Field(None, min_length=1)
 
 
+class GrokConfigIn(BaseModel):
+    mode: str = Field(..., min_length=1)  # local-direct | grok
+    model: Optional[str] = Field(None, min_length=1)
+
+
 class ClaudeBridgeIn(BaseModel):
     enabled: bool
 
@@ -191,6 +196,7 @@ async def get_config(_: str = Depends(auth.require_master)):
         "port": cfg.get("port", 4100),
         "codex": codex_sync.status(),
         "claude": claude_sync.status(),
+        "grok": grok_sync.status(),
     }
 
 
@@ -202,6 +208,11 @@ async def set_active_model(body: ActiveModelIn, _: str = Depends(auth.require_ma
 @router.put("/api/claude/config")
 async def set_claude_config(body: ClaudeConfigIn, _: str = Depends(auth.require_master)):
     return core._apply_claude_config(body.mode, body.model)
+
+
+@router.put("/api/grok/config")
+async def set_grok_config(body: GrokConfigIn, _: str = Depends(auth.require_master)):
+    return core._apply_grok_config(body.mode, body.model)
 
 
 @router.put("/api/claude/bridge")
@@ -255,6 +266,7 @@ async def list_models(_: str = Depends(auth.require_master)):
         "probe_interval_sec": core.probe_interval_sec(cfg),
         "codex": codex_sync.status(),
         "claude": claude_sync.status(),
+        "grok": grok_sync.status(),
     }
 
 

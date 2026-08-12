@@ -229,7 +229,7 @@ def _supports_reasoning_effort(model: str) -> bool:
     if m.startswith("gpt-") and len(m) > 4 and m[4].isdigit() and int(m[4]) >= 5:
         return True
     # xAI Grok Build
-    if m == "grok-4.5" or m.startswith("grok-4.5-") or m.startswith("grok-build-"):
+    if m == "grok-4.6" or m.startswith("grok-4.6-") or m.startswith("grok-build-"):
         return True
     # Switchyard 的 DeepSeek 池也走 Responses 风格 reasoning_effort
     if m.startswith("deepseek-"):

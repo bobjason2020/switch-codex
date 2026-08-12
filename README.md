@@ -71,6 +71,24 @@ Anthropic 格式直接透传（零转换）；未开启的上游走 Anthropic �
 注意：`~/.claude/settings.json` 由本路由管理；如果同时使用其它会改写该文件的工具
 （例如 cc-switch 的本地代理接管），请只保留一个写入方，避免配置互相覆盖。
 
+## Grok
+
+路由同样服务 Grok CLI（grok-build）的 OpenAI **Responses** 请求（与 `/v1/responses`
+共用同一套模型池、倍率、failover 与日志）。UI 的「Grok 配置」支持两种模式：
+
+- **本机原配置**：恢复项目介入前的 `~/.grok/config.toml` 快照，Grok CLI 直连原 provider；
+- **grok 池**：在 `~/.grok/config.toml` 写入受管模型段 `[model."switchyard"]`（`base_url`
+  指向本路由、`api_backend = "responses"`、`api_key` 为路由 master key），并把
+  `[models].default` 切到该段。受管段的 `model` 为 grok 池下的客户端模型
+  （默认 `grok-4.6`），其它配置（用户自定义模型、mcp_servers、ui、marketplace 等）原样保留。
+
+grok 池的初始上游在服务启动时自动从 `~/.grok/config.toml` 中现有的自定义 grok 端点
+seed 一次（settings 键 `grok_pool_v1` 门控）；没有可用端点时会跳过并在下次启动重试，
+也可在管理后台手动添加 `grok` 池上游。切换配置后请 **新开 Grok 会话**。
+
+注意：`~/.grok/config.toml` 由本路由管理受管段与 `[models].default`；如果同时使用其它
+会改写该文件的工具，请只保留一个写入方，避免配置互相覆盖。
+
 ## 代码结构
 
 后端拆成 `sy/` 包，前端拆成独立 JS 模块，不再有数千行单文件：
@@ -88,6 +106,8 @@ sy/
   proxy.py              # /v1/responses、/v1/messages 透传/转换与 failover
   anthropic.py          # Anthropic Messages ↔ Responses 转换（含流式）
   claude_sync.py        # Claude Code settings.json 快照/恢复
+  grok_sync.py          # Grok CLI config.toml 受管段/快照/恢复
+  migrate_grok.py       # 一次性 seed grok 池上游（读 ~/.grok/config.toml）
   bridge/               # vendored claude-auto-mode-bridge（MIT，classifier.py + rules.json + LICENSE，纯拷贝不改）
   api.py                # 管理 API 路由
 static/
@@ -105,6 +125,7 @@ static/
 | `data/legacy-backup/` | 首次启动时自动归档的旧 JSON/JSONL 文件（一次性迁移） |
 | `data/deepseek-models.json` | 官方 models 模板 |
 | `data/codex-backup/` | DeepSeek 模式前的 Codex 备份 |
+| `data/grok-backup/` | Grok 介入前快照与 restore-point 备份 |
 | `logs/switchyard.tmux.log` | 服务运行日志 |
 
 旧版本使用的 `config.json` / `upstreams.json` / `auth.json` /
@@ -119,6 +140,7 @@ static/
 | PUT | `/api/active-model` | `{"active_model":"..."}` 切换池 + 同步 Codex |
 | GET | `/api/models` | 模型池 + codex_sync 类型 |
 | GET | `/api/config` | 含 codex 状态 |
+| PUT | `/api/grok/config` | `{"mode":"local-direct"\|"grok","model":"grok"}` 切换 Grok CLI 配置 |
 | GET | `/api/logs/models` | 实际调用模型列表及请求次数（来自 `client_model`） |
 | GET | `/api/logs` | 请求日志（`limit/offset/range/start/end/pool/model/status/q`；`range` 支持 `today`/`yesterday`/`3d`/`7d`/`30d`/`custom`，自定义时传 `start`/`end`，status 支持 `success`/`error`/数字） |
 | GET | `/api/logs/stats` | 请求统计（支持 `range` 的 `today`/`yesterday`/`3d`/`7d`/`30d` 及 `pool/model` 筛选；含 `per_model`、`model_breakdown`、`per_pool`、`upstream_breakdown`） |

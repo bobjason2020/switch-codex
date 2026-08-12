@@ -292,6 +292,42 @@ body::before {
 }
 .card-head h2 { margin: 0; }
 
+/* ---------- 上游按池快捷切换 ---------- */
+.pool-switch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.pool-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: #0c121c;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.pool-chip:hover {
+  border-color: var(--amber);
+  color: var(--text);
+}
+.pool-chip.active {
+  background: rgba(245, 185, 66, 0.16);
+  border-color: rgba(245, 185, 66, 0.5);
+  color: #ffe2a8;
+  font-weight: 600;
+}
+.pool-chip-count {
+  font-size: 0.68rem;
+  opacity: 0.78;
+}
+
 /* ---------- 表单控件 ---------- */
 label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 4px; }
 input, select {

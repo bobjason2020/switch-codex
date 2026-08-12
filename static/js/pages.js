@@ -53,16 +53,64 @@
       }
     };
 
+    let upstreamPoolFilter = "";
+
+    function upstreamPoolOf(u) {
+      return String(u && u.model != null ? u.model : "").trim() || "未分组";
+    }
+
+    function renderUpstreamPoolSwitch(rows) {
+      const wrap = $("upstreamPoolSwitch");
+      wrap.innerHTML = "";
+      const counts = new Map();
+      const pools = [];
+      for (const u of rows) {
+        const pool = upstreamPoolOf(u);
+        if (!counts.has(pool)) {
+          counts.set(pool, 0);
+          pools.push(pool);
+        }
+        counts.set(pool, counts.get(pool) + 1);
+      }
+      if (upstreamPoolFilter && !counts.has(upstreamPoolFilter)) {
+        upstreamPoolFilter = "";
+      }
+      const chips = [
+        ["", "全部", rows.length],
+        ...pools.map((p) => [p, p, counts.get(p)]),
+      ];
+      for (const [value, label, count] of chips) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "pool-chip" + (value === upstreamPoolFilter ? " active" : "");
+        btn.setAttribute("aria-pressed", value === upstreamPoolFilter ? "true" : "false");
+        btn.innerHTML = escapeHtml(label) + '<span class="pool-chip-count">' + count + "</span>";
+        btn.onclick = () => {
+          if (upstreamPoolFilter === value) return;
+          upstreamPoolFilter = value;
+          loadUpstreams();
+        };
+        wrap.appendChild(btn);
+      }
+    }
+
     async function loadUpstreams() {
       try {
         const data = await api("/api/upstreams");
+        const rows = data.data || [];
+        renderUpstreamPoolSwitch(rows);
+        const visible = upstreamPoolFilter
+          ? rows.filter((u) => upstreamPoolOf(u) === upstreamPoolFilter)
+          : rows;
         const tb = $("tbody");
         tb.innerHTML = "";
-        if (!data.data.length) {
-          tb.innerHTML = '<tr><td colspan="6" class="muted">暂无上游，点击右上角「添加上游」</td></tr>';
+        if (!visible.length) {
+          tb.innerHTML = '<tr><td colspan="6" class="muted">' +
+            (upstreamPoolFilter ? "该池暂无上游，点击右上角「添加上游」" : "暂无上游，点击右上角「添加上游」") +
+            "</td></tr>";
           return;
         }
-        for (const u of data.data) {
+        for (const u of visible) {
           const inScope = u.model === activeModel;
           const tr = document.createElement("tr");
           if (inScope && u.enabled) tr.style.background = "rgba(59,130,246,0.06)";
@@ -747,14 +795,17 @@
       let text, cls;
       if (mode === "local-direct") { text = "本机原配置"; cls = "ok"; }
       else if (mode === "openai-all") { text = "openai（走 4100）"; cls = "ok"; }
-      else if (mode === "deepseek") { text = (st.config_model || "deepseek") + "（走 4100）"; cls = "ok"; }
+      else if (mode === "deepseek") { text = "deepseek（走 4100）"; cls = "ok"; }
       else if (mode === "routing-only") { text = "仅路由（未改配置）"; cls = "disabled"; }
       else { text = "未配置"; cls = ""; }
       pill.className = "pill" + (cls ? " " + cls : "");
       pill.textContent = text;
       const label = $("codexModelLabel");
       if (label) {
-        const m = st.config_model || st.provider || "";
+        let m = "";
+        if (mode === "deepseek") m = DEEPSEEK_POOL;
+        else if (mode === "openai-all") m = DEFAULT_MODEL;
+        else m = st.config_model || st.provider || "";
         label.textContent = m || "";
       }
       const changes = $("codexChanges");
@@ -773,7 +824,7 @@
       let text, cls;
       if (mode === "local-direct") { text = "本机原配置"; cls = "ok"; }
       else if (mode === "openai-all") { text = "openai（走 4100）"; cls = "ok"; }
-      else if (mode === "deepseek") { text = (st.config_model || "deepseek") + "（走 4100）"; cls = "ok"; }
+      else if (mode === "deepseek") { text = "deepseek（走 4100）"; cls = "ok"; }
       else { text = "未配置"; cls = ""; }
       pill.className = "pill" + (cls ? " " + cls : "");
       pill.textContent = text;
@@ -800,6 +851,31 @@
       }
     }
 
+    function renderGrokStatus() {
+      const pill = $("grokModePill");
+      if (!pill) return;
+      const st = grokStatus || {};
+      const mode = st.mode || "";
+      let text, cls;
+      if (mode === "local-direct") { text = "本机原配置"; cls = "ok"; }
+      else if (mode === "grok") { text = (st.pool || "grok") + "（走 4100）"; cls = "ok"; }
+      else { text = "未配置"; cls = ""; }
+      pill.className = "pill" + (cls ? " " + cls : "");
+      pill.textContent = text;
+      const label = $("grokModelLabel");
+      if (label) {
+        label.textContent = st.config_exists
+          ? "model: " + (st.config_model || "") + " · " + (st.config_base_url || "")
+          : "config.toml 不存在";
+      }
+      const changes = $("grokChanges");
+      if (changes) {
+        changes.textContent =
+          (mode ? "当前模式：" + text : "未介入配置") +
+          (st.applied_at ? " · 最近应用 " + fmtTs(st.applied_at) : "");
+      }
+    }
+
     $("btnApplyClaude").onclick = async () => {
       const v = ($("claudeModel").value || "local-direct").trim();
       const isDeepseek = v !== "local-direct" && v !== DEFAULT_MODEL;
@@ -817,6 +893,24 @@
           mode === "openai-all" ? "已配置走 4100（openai 池）" : "已配置走 4100（" + v + " 池）";
         showMsg("Claude Code：" + modeText + "\n" + changes + "\n请新开 Claude Code 会话使配置生效。", true);
         renderClaudeStatus();
+        await refreshModels();
+      } catch (e) { showMsg(e.message, false); }
+    };
+
+    $("btnApplyGrok").onclick = async () => {
+      const v = ($("grokModel").value || "local-direct").trim();
+      const mode = v === "local-direct" ? "local-direct" : "grok";
+      const payload = { mode };
+      if (mode === "grok") payload.model = v;
+      try {
+        showMsg("正在应用 Grok 配置 " + v + " …", true);
+        const r = await api("/api/grok/config", { method: "PUT", body: JSON.stringify(payload) });
+        grokStatus = r.grok || {};
+        const changes = (r.changes || []).map((x) => "· " + x).join("\n");
+        const modeText =
+          mode === "local-direct" ? "已恢复本机原配置" : "已配置走 4100（" + v + " 池）";
+        showMsg("Grok CLI：" + modeText + "\n" + changes + "\n请新开 Grok 会话使配置生效。", true);
+        renderGrokStatus();
         await refreshModels();
       } catch (e) { showMsg(e.message, false); }
     };

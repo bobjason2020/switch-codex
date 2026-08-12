@@ -18,9 +18,13 @@ import httpx
 
 from sy import core, db, logbook, state, timeutil
 from sy.const import (
+    DEEPSEEK_CLIENT_MODELS,
+    DEEPSEEK_POOL,
     DEFAULT_MODEL,
     DEFAULT_NEWAPI_PROBE,
     DEFAULT_PROBE_INTERVAL_SEC,
+    GROK_CLIENT_MODELS,
+    GROK_POOL,
 )
 
 log = logging.getLogger("switchyard.probes")
@@ -177,7 +181,35 @@ def mark_model_upstream_failed(
 
 
 def _probe_model_for_pool(umodel: str) -> str:
-    return "gpt-5.6-sol" if umodel == DEFAULT_MODEL else umodel
+    """池名 -> 一个具体的代表客户端模型（避免把池名直接当模型名探测）。"""
+    umodel = str(umodel or "").strip()
+    if umodel == DEFAULT_MODEL:
+        return "gpt-5.6-sol"
+    if umodel == DEEPSEEK_POOL:
+        return DEEPSEEK_CLIENT_MODELS[0]
+    if umodel == GROK_POOL:
+        return GROK_CLIENT_MODELS[0]
+    return umodel
+
+
+def _pick_probe_client_model(target: dict, umodel: str) -> str:
+    """未指定客户端模型时，选一个该上游真正支持的具体模型名。
+
+    优先从 model_map 里挑池代表模型（如 deepseek-v4-flash），没有代表模型时
+    退回第一条映射；这样 core.upstream_request_model 才能解析出 actual 模型，
+    而不是把 pool 名（openai / deepseek / grok）直接发给上游。
+    """
+    preferred = _probe_model_for_pool(umodel)
+    entries = target.get("model_map")
+    if isinstance(entries, list) and entries:
+        for e in entries:
+            if str(e.get("model") or "").strip() == preferred:
+                return preferred
+        for e in entries:
+            m = str(e.get("model") or "").strip()
+            if m:
+                return m
+    return preferred
 
 
 async def _probe_upstream(
@@ -190,7 +222,10 @@ async def _probe_upstream(
 ) -> dict[str, Any]:
     uid = str(target.get("id") or "")
     umodel = core.normalize_model(target.get("model"))
-    probe_model = str(client_model or "").strip() or _probe_model_for_pool(umodel)
+    probe_model = (
+        str(client_model or "").strip()
+        or _pick_probe_client_model(target, umodel)
+    )
     request_model = core.upstream_request_model(target, probe_model)
     payload_model = request_model or probe_model
     chat_mode = bool(target.get("chat_completions"))

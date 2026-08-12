@@ -90,6 +90,11 @@
       return name === "deepseek" || name.startsWith("deepseek-");
     }
 
+    function isGrokPool(m) {
+      const name = String(m || "").trim().toLowerCase();
+      return name === "grok" || name.startsWith("grok-");
+    }
+
     function deepseekPool() {
       return DEEPSEEK_POOL;
     }
@@ -101,6 +106,7 @@
         if (upstreamEditModel && isDeepseekPool(upstreamEditModel)) return upstreamEditModel;
         return deepseekPool();
       }
+      if (t === "grok") return GROK_POOL;
       if (t === "custom") return resolveFormModel();
       return DEFAULT_MODEL;
     }
@@ -130,6 +136,9 @@
       }
       if (type === "deepseek") {
         return DEEPSEEK_CLIENT_MODELS.map((m) => ({ model: m, actual: "" }));
+      }
+      if (type === "grok") {
+        return GROK_CLIENT_MODELS.map((m) => ({ model: m, actual: "" }));
       }
       return [];
     }
@@ -210,6 +219,7 @@
       if (!u) type = DEFAULT_MODEL;
       else if (u.model === DEFAULT_MODEL) type = DEFAULT_MODEL;
       else if (isDeepseekPool(u.model)) type = "deepseek";
+      else if (isGrokPool(u.model)) type = "grok";
       $("upstreamType").value = type;
       renderModelMap(u ? u.model_map : defaultModelMapForType(type));
       $("upstreamModalTitle").textContent = u ? "编辑上游：" + u.name : "新增上游";
@@ -353,11 +363,14 @@
       activeModel = data.active_model || DEFAULT_MODEL;
       codexStatus = data.codex || {};
       claudeStatus = data.claude || {};
+      grokStatus = data.grok || {};
       fillModelSelect($("activeModel"), activeModel, true);
       fillPoolSelect($("modelSelect"), $("modelSelect").value || DEFAULT_MODEL);
       fillClaudeModelSelect();
+      fillGrokModelSelect();
       renderCodexStatus();
       renderClaudeStatus();
+      renderGrokStatus();
     }
 
     function fillClaudeModelSelect() {
@@ -374,5 +387,27 @@
       parts.push(
         `<option value="${escapeHtml(DEEPSEEK_POOL)}"${cur === DEEPSEEK_POOL ? " selected" : ""}>${escapeHtml(DEEPSEEK_POOL)}</option>`
       );
+      sel.innerHTML = parts.join("");
+    }
+
+    function fillGrokModelSelect() {
+      const sel = $("grokModel");
+      if (!sel) return;
+      const mode = grokStatus.mode || "";
+      let cur = "local-direct";
+      if (mode === "grok") cur = grokStatus.pool || GROK_POOL;
+      const pools = (knownPools || [])
+        .filter((p) => isGrokPool(p))
+        .filter((p, i, arr) => arr.indexOf(p) === i)
+        .sort();
+      if (cur !== "local-direct" && cur && !pools.includes(cur)) pools.push(cur);
+      const parts = [
+        `<option value="local-direct"${cur === "local-direct" ? " selected" : ""}>本机原配置</option>`,
+      ];
+      for (const p of pools) {
+        parts.push(
+          `<option value="${escapeHtml(p)}"${p === cur ? " selected" : ""}>${escapeHtml(p)}</option>`
+        );
+      }
       sel.innerHTML = parts.join("");
     }

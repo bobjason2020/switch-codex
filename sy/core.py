@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 from fastapi import HTTPException
 
-from sy import claude_sync, codex_sync, db, state, timeutil
+from sy import claude_sync, codex_sync, db, grok_sync, state, timeutil
 from sy.const import (
     CACHE_PRIORITY_TTL_SEC,
     DEFAULT_CLIENT_MODELS,
@@ -25,6 +25,9 @@ from sy.const import (
     DEEPSEEK_CLIENT_MODELS,
     DEEPSEEK_DEFAULT_MODEL_MAP,
     DEEPSEEK_POOL,
+    GROK_CLIENT_MODELS,
+    GROK_DEFAULT_MODEL_MAP,
+    GROK_POOL,
     PROBE_MULTIPLIER_THRESHOLD,
     env_host,
     env_port,
@@ -336,12 +339,14 @@ def light_for_multiplier(multiplier: Optional[float], ok: bool) -> str:
 
 
 def pool_for_client_model(client_model: str) -> str:
-    """把客户端模型名映射到路由池。DeepSeek slug 统一进通用 deepseek 池。"""
+    """把客户端模型名映射到路由池。DeepSeek / Grok slug 统一进各自通用池。"""
     m = str(client_model or "").strip()
     if not m:
         return DEFAULT_MODEL
     if m == DEEPSEEK_POOL or codex_sync.is_deepseek_model(m):
         return DEEPSEEK_POOL
+    if m == GROK_POOL or grok_sync.is_grok_model(m):
+        return GROK_POOL
     pools = collect_models()
     for pool in pools:
         if normalize_model(pool) == m:
@@ -360,6 +365,8 @@ def resolve_route_pool(
         return DEFAULT_MODEL
     if active == DEEPSEEK_POOL or codex_sync.is_deepseek_model(active):
         return DEEPSEEK_POOL
+    if active == GROK_POOL or grok_sync.is_grok_model(active):
+        return GROK_POOL
     return active
 
 
@@ -498,6 +505,10 @@ def collect_client_models_for_availability() -> list[str]:
         normalize_model(u.get("model")) == DEEPSEEK_POOL for u in load_upstreams()
     ):
         names.update(DEEPSEEK_CLIENT_MODELS)
+    if any(
+        normalize_model(u.get("model")) == GROK_POOL for u in load_upstreams()
+    ):
+        names.update(GROK_CLIENT_MODELS)
     head = [m for m in DEFAULT_CLIENT_MODELS if m in names]
     rest = sorted(n for n in names if n not in head)
     return head + rest
@@ -561,6 +572,8 @@ def default_model_map_for(model: Optional[str]) -> list[dict]:
     pool = normalize_model(model)
     if pool == DEEPSEEK_POOL or codex_sync.is_deepseek_model(pool):
         return normalize_model_map([dict(e) for e in DEEPSEEK_DEFAULT_MODEL_MAP])
+    if pool == GROK_POOL or grok_sync.is_grok_model(pool):
+        return normalize_model_map([dict(e) for e in GROK_DEFAULT_MODEL_MAP])
     if pool == DEFAULT_MODEL:
         return normalize_model_map([dict(e) for e in DEFAULT_OPENAI_ALL_MODEL_MAP])
     return [{"model": pool, "actual": pool}]
@@ -1003,6 +1016,43 @@ def _apply_claude_bridge(enabled: bool) -> dict[str, Any]:
         "enabled": bool(enabled),
         "changes": list(changes),
         "claude": claude_sync.status(),
+    }
+
+
+def _apply_grok_config(mode: str, model: Optional[str] = None) -> dict[str, Any]:
+    """Grok CLI 配置同步：local-direct / grok 两种模式。
+
+    grok 是整体模式：受管段用当前 grok 客户端模型（无则 grok-4.6），
+    /model 在 Grok 内切换；local-direct 恢复介入前快照、直连原端点。
+
+    注意：不修改全局 active_model——那是 Codex 卡共用的路由默认池，Grok 请求
+    自带 model=grok-4.6，pool_for_client_model 会直接归入 grok 池，与 active_model
+    无关。改成 grok 不应让 Codex 卡的状态/配置跟着变。
+    """
+    m = (mode or "").strip()
+    if m not in ("local-direct", "grok"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"未知 Grok 模式 {m!r}（仅支持 local-direct / grok）",
+        )
+    pool = (model or "").strip() or grok_sync.GROK_POOL
+    if m == "grok" and not grok_sync.is_grok_pool(pool):
+        raise HTTPException(
+            status_code=400,
+            detail=f"不是 Grok 池: {pool!r}（如 grok）",
+        )
+
+    try:
+        result = grok_sync.sync_for_mode(m, pool)
+    except Exception as e:
+        log.exception("grok sync failed for mode=%s pool=%s", m, pool)
+        raise HTTPException(status_code=500, detail=f"Grok 配置同步失败: {e}") from e
+
+    return {
+        "mode": m,
+        "active_model": normalize_model(load_config().get("active_model")),
+        "grok": grok_sync.status(),
+        "changes": result.get("changes") or result.get("actions") or [],
     }
 
 
