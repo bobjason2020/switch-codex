@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
 
-from sy.codex_sync import _router_master_key, is_deepseek_model
+from sy.codex_sync import _atomic_write, _read_text_file, _router_master_key, is_deepseek_model
 from sy.const import DEEPSEEK_CLIENT_MODELS, provider_base_url
 
 log = logging.getLogger("switchyard.claude_sync")
@@ -92,7 +92,7 @@ def _read_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(_read_text_file(path))
     except Exception:
         return default
 
@@ -112,16 +112,11 @@ def _copy_file_if_exists(src: Path, dst: Path) -> bool:
         return False
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
-    dst.chmod(0o600)
+    try:
+        dst.chmod(0o600)
+    except OSError:
+        pass
     return True
-
-
-def _atomic_write(path: Path, text: str) -> None:
-    """原子写：同目录 tmp 文件 + replace（仿 codex_sync._atomic_write）。"""
-    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.chmod(0o600)
-    tmp.replace(path)
 
 
 def _read_settings() -> dict:
@@ -130,7 +125,7 @@ def _read_settings() -> dict:
     if not p.exists():
         return {}
     try:
-        obj = json.loads(p.read_text(encoding="utf-8"))
+        obj = json.loads(_read_text_file(p))
     except Exception as exc:
         raise RuntimeError(f"解析 Claude settings.json 失败: {p}（{exc}）") from exc
     if not isinstance(obj, dict):
@@ -489,7 +484,7 @@ def status() -> dict:
     config_model: Optional[str] = None
     try:
         if sp.exists():
-            obj = json.loads(sp.read_text(encoding="utf-8"))
+            obj = json.loads(_read_text_file(sp))
             env = obj.get("env") if isinstance(obj, dict) else None
             if isinstance(env, dict):
                 config_base_url = env.get("ANTHROPIC_BASE_URL")
@@ -522,7 +517,7 @@ def current_deepseek_slug() -> Optional[str]:
     """读当前 Claude settings 里的 ANTHROPIC_MODEL；是 DeepSeek slug 才返回。"""
     try:
         if settings_path().exists():
-            obj = json.loads(settings_path().read_text(encoding="utf-8"))
+            obj = json.loads(_read_text_file(settings_path()))
             env = obj.get("env") if isinstance(obj, dict) else None
             model = env.get("ANTHROPIC_MODEL") if isinstance(env, dict) else None
             if is_deepseek_model(model or ""):

@@ -143,11 +143,36 @@ def auth_path() -> Path:
     return codex_home() / "auth.json"
 
 
+def _read_text_file(path: Path) -> str:
+    """读文本配置：兼容 Windows UTF-8 BOM / UTF-16。"""
+    raw = path.read_bytes()
+    if not raw:
+        return ""
+    if raw.startswith(b"\xff\xfe"):
+        text = raw.decode("utf-16-le")
+    elif raw.startswith(b"\xfe\xff"):
+        text = raw.decode("utf-16-be")
+    elif raw.startswith(b"\xef\xbb\xbf"):
+        text = raw[3:].decode("utf-8")
+    else:
+        nul = raw[:64].count(0)
+        if nul >= 8:
+            try:
+                text = raw.decode("utf-16")
+            except UnicodeDecodeError:
+                text = raw.decode("utf-8")
+        else:
+            text = raw.decode("utf-8")
+    if text.startswith("\ufeff"):
+        text = text.lstrip("\ufeff")
+    return text
+
+
 def _read_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(_read_text_file(path))
     except Exception:
         return default
 
@@ -157,7 +182,10 @@ def _copy_file_if_exists(src: Path, dst: Path) -> bool:
         return False
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
-    dst.chmod(0o600)
+    try:
+        dst.chmod(0o600)
+    except OSError:
+        pass
     return True
 
 
@@ -174,9 +202,16 @@ def _router_master_key() -> str:
 
 def _atomic_write(path: Path, text: str) -> None:
     tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.chmod(0o600)
-    tmp.replace(path)
+    tmp.write_text(text, encoding="utf-8", newline="\n")
+    try:
+        tmp.chmod(0o600)
+    except OSError:
+        pass
+    try:
+        tmp.replace(path)
+    except OSError:
+        path.unlink(missing_ok=True)
+        tmp.replace(path)
 
 
 def ensure_original_snapshot() -> dict:
@@ -581,7 +616,7 @@ def apply_deepseek(model_slug: str) -> dict[str, Any]:
     ensure_models_template()
 
     cfg_p = config_path()
-    original = cfg_p.read_text(encoding="utf-8") if cfg_p.exists() else ""
+    original = _read_text_file(cfg_p) if cfg_p.exists() else ""
     new_text, report = transform_config_toml(original, model_slug, mode="deepseek")
     _atomic_write(cfg_p, new_text)
 
@@ -617,11 +652,11 @@ def apply_openai_all() -> dict[str, Any]:
 
     # 基准：最近一次 openai 快照 > 原始快照 > 当前配置
     if OPENAI_SNAP_CONFIG.exists():
-        base_text = OPENAI_SNAP_CONFIG.read_text(encoding="utf-8")
+        base_text = _read_text_file(OPENAI_SNAP_CONFIG)
     elif (ORIGINAL_DIR / "config.toml").exists():
-        base_text = (ORIGINAL_DIR / "config.toml").read_text(encoding="utf-8")
+        base_text = _read_text_file(ORIGINAL_DIR / "config.toml")
     else:
-        base_text = config_path().read_text(encoding="utf-8") if config_path().exists() else ""
+        base_text = _read_text_file(config_path()) if config_path().exists() else ""
 
     new_text, report = transform_config_toml(base_text, DEFAULT_MODEL, mode="openai-all")
     _atomic_write(config_path(), new_text)
@@ -735,7 +770,8 @@ def status() -> dict[str, Any]:
     model = None
     provider = None
     if cfg.exists():
-        for line in cfg.read_text(encoding="utf-8").splitlines():
+        cfg_text = _read_text_file(cfg)
+        for line in cfg_text.splitlines():
             if _trim(line).startswith("[") and not line.strip().startswith("#"):
                 # only top-level until first section — rough
                 pass
@@ -743,7 +779,7 @@ def status() -> dict[str, Any]:
         depth = 0
         ml = ""
         in_top = True
-        for line in cfg.read_text(encoding="utf-8").splitlines():
+        for line in cfg_text.splitlines():
             if in_top and _is_section_header(line, depth, ml):
                 in_top = False
                 continue
@@ -774,7 +810,7 @@ def _current_top_model() -> Optional[str]:
         return None
     depth = 0
     ml = ""
-    for line in cfg.read_text(encoding="utf-8").splitlines():
+    for line in _read_text_file(cfg).splitlines():
         if _is_section_header(line, depth, ml):
             break
         k = _key_of(line)

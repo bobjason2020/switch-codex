@@ -27,8 +27,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from sy.codex_sync import (
+    _atomic_write,
     _is_section_header,
     _key_of,
+    _read_text_file,
     _router_master_key,
     _scan_line,
     _section_name,
@@ -110,20 +112,30 @@ def _copy_file_if_exists(src: Path, dst: Path) -> bool:
         return False
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
-    dst.chmod(0o600)
+    try:
+        dst.chmod(0o600)
+    except OSError:
+        pass
     return True
 
 
-def _atomic_write(path: Path, text: str) -> None:
-    """原子写：同目录 tmp 文件 + replace（仿 codex_sync._atomic_write）。"""
-    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.chmod(0o600)
-    tmp.replace(path)
+def _normalize_toml_text(text: str) -> str:
+    """去掉 Windows 记事本/部分客户端写入的 BOM，空文件当空表。"""
+    if text.startswith("\ufeff"):
+        text = text.lstrip("\ufeff")
+    return text
+
+
+def _read_config_text(path: Path) -> str:
+    """读 Grok config.toml：兼容 UTF-8 BOM 与 UTF-16（Windows 常见）。"""
+    return _normalize_toml_text(_read_text_file(path))
 
 
 def _parse_config(text: str) -> dict:
     """解析 TOML；损坏直接抛中文 RuntimeError（调用方不得半改文件）。"""
+    text = _normalize_toml_text(text)
+    if not text.strip():
+        return {}
     try:
         obj = tomllib.loads(text)
     except Exception as exc:
@@ -368,7 +380,7 @@ def apply_grok_pool(pool_name: str, model_slug: Optional[str] = None) -> dict:
 
     ensure_original_snapshot()
     sp = config_path()
-    original = sp.read_text(encoding="utf-8") if sp.exists() else ""
+    original = _read_config_text(sp) if sp.exists() else ""
     new_text, changes = transform_config_toml(original, slug)
     sp.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write(sp, new_text)
@@ -461,7 +473,7 @@ def status() -> dict:
     managed_present = False
     try:
         if config_exists:
-            obj = tomllib.loads(sp.read_text(encoding="utf-8"))
+            obj = _parse_config(_read_config_text(sp))
             models_section = obj.get("models")
             if isinstance(models_section, dict):
                 default_model = models_section.get("default")

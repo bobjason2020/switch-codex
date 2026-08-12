@@ -10,13 +10,13 @@
 from __future__ import annotations
 
 import logging
-import tomllib
 import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from sy import db
+from sy.grok_sync import _parse_config, _read_config_text
 from sy.const import (
     GROK_CLIENT_MODELS,
     GROK_DEFAULT_MODEL_MAP,
@@ -41,7 +41,7 @@ def _candidate_entries() -> list[dict[str, str]]:
     if not p.exists():
         return []
     try:
-        obj = tomllib.loads(p.read_text(encoding="utf-8"))
+        obj = _parse_config(_read_config_text(p))
     except Exception as exc:
         log.warning("skip grok pool seeding: failed to parse %s (%s)", p, exc)
         return []
