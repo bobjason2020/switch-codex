@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from sy import db as sr_db
-from sy.const import provider_base_url
+from sy.const import DEEPSEEK_CLIENT_MODELS, DEEPSEEK_POOL, provider_base_url
 
 log = logging.getLogger("switchyard.codex_sync")
 
@@ -39,9 +39,9 @@ BACKUP_CONFIG = BACKUP_DIR / "config.toml"
 BACKUP_MODELS = BACKUP_DIR / "models.json"
 MANIFEST = BACKUP_DIR / "manifest.json"
 
-DEFAULT_MODEL = "openai-all"
+DEFAULT_MODEL = "openai"
 LOCAL_DIRECT = "local-direct"
-DEEPSEEK_KNOWN = {"deepseek-v4-flash", "deepseek-v4-pro"}
+DEEPSEEK_KNOWN = set(DEEPSEEK_CLIENT_MODELS)  # 与 sy.const 保持单一事实源
 MODELS_TEMPLATE_URL = "https://cdn.deepseek.com/api-docs/codex-deepseek-setup.sh"
 ROUTER_CONFIG = DATA / "config.json"
 
@@ -706,13 +706,15 @@ def sync_for_active_model(active_model: str) -> dict[str, Any]:
         return restore_local_original()
     if active == DEFAULT_MODEL:
         return apply_openai_all()
+    if active == DEEPSEEK_POOL:
+        return apply_deepseek_pool()
     if is_deepseek_model(active):
         return apply_deepseek(active)
     # other custom pools: do not touch codex (routing only)
     return {
         "mode": "routing-only",
         "model_slug": active,
-        "note": "非 DeepSeek / 非 openai-all / 非本机原配置：只切换路由池，不改 Codex 配置",
+        "note": "非 DeepSeek / 非 openai / 非本机原配置：只切换路由池，不改 Codex 配置",
     }
 
 
@@ -752,3 +754,33 @@ def status() -> dict[str, Any]:
         "config_model": model,
         "config_provider": provider,
     }
+
+
+def _current_top_model() -> Optional[str]:
+    """读取 config.toml 顶层 model（不进入任何 section）。"""
+    cfg = config_path()
+    if not cfg.exists():
+        return None
+    depth = 0
+    ml = ""
+    for line in cfg.read_text(encoding="utf-8").splitlines():
+        if _is_section_header(line, depth, ml):
+            break
+        k = _key_of(line)
+        if k == "model" and "=" in line:
+            val = _trim(line.split("=", 1)[1]).strip('"').strip("'")
+            if val:
+                return val
+        depth, ml = _scan_line(line, depth, ml)
+    return None
+
+
+def apply_deepseek_pool() -> dict[str, Any]:
+    """整体 deepseek 模式：写 provider + 含 flash/pro 的 models.json，保留当前 DeepSeek 模型作为默认。"""
+    ensure_original_snapshot()
+    _save_openai_snapshot_if_needed()
+    ensure_models_template()
+    slug = _current_top_model()
+    if not is_deepseek_model(slug or ""):
+        slug = "deepseek-v4-flash"
+    return apply_deepseek(slug)

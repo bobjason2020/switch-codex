@@ -16,6 +16,8 @@ from sy.const import (
     DEFAULT_MODEL,
     DEFAULT_NEWAPI_PROBE,
     DEFAULT_PROBE_INTERVAL_SEC,
+    DEEPSEEK_CLIENT_MODELS,
+    DEEPSEEK_POOL,
     ERROR_LOG_RETENTION_HOURS,
     PROBE_MULTIPLIER_THRESHOLD,
 )
@@ -211,27 +213,44 @@ async def set_claude_bridge(body: ClaudeBridgeIn, _: str = Depends(auth.require_
 async def list_models(_: str = Depends(auth.require_master)):
     cfg = core.load_config()
     items = core.load_upstreams()
-    models = core.collect_models(items)
-    counts: dict[str, int] = {m: 0 for m in models}
-    for u in items:
-        if u.get("enabled", True):
-            m = core.normalize_model(u.get("model"))
-            counts[m] = counts.get(m, 0) + 1
+
+    def enabled_in_pool(pool: str, client_model: Optional[str] = None) -> int:
+        n = 0
+        for u in items:
+            if not u.get("enabled", True):
+                continue
+            if core.normalize_model(u.get("model")) != core.normalize_model(pool):
+                continue
+            if client_model and not core.upstream_supports_model(u, client_model):
+                continue
+            n += 1
+        return n
+
+    def entry(model: str, pool: str, passthrough: bool, sync_label: str) -> dict:
+        return {
+            "model": model,
+            "pool": pool,
+            "enabled_upstreams": enabled_in_pool(pool),
+            "passthrough": passthrough,
+            "probe_enabled": core.probe_enabled_for_model(model, cfg),
+            "codex_sync": sync_label,
+        }
+
+    data = [
+        entry(DEFAULT_MODEL, DEFAULT_MODEL, True, "restore"),
+        entry(DEEPSEEK_POOL, DEEPSEEK_POOL, False, "official-deepseek"),
+    ]
+
+    pools = core.collect_models(items)
+    for pool in pools:
+        if pool in (DEFAULT_MODEL, DEEPSEEK_POOL) or codex_sync.is_deepseek_model(pool):
+            continue
+        data.append(entry(pool, pool, False, "routing-only"))
+
+    pool_rows = [{"model": p, "enabled_upstreams": enabled_in_pool(p)} for p in pools]
     return {
-        "data": [
-            {
-                "model": m,
-                "enabled_upstreams": counts.get(m, 0),
-                "passthrough": m == DEFAULT_MODEL,
-                "probe_enabled": core.probe_enabled_for_model(m, cfg),
-                "codex_sync": (
-                    "restore"
-                    if m == DEFAULT_MODEL
-                    else ("official-deepseek" if codex_sync.is_deepseek_model(m) else "routing-only")
-                ),
-            }
-            for m in models
-        ],
+        "data": data,
+        "pools": pool_rows,
         "active_model": core.normalize_model(cfg.get("active_model")),
         "probe_interval_sec": core.probe_interval_sec(cfg),
         "codex": codex_sync.status(),
@@ -585,7 +604,7 @@ async def delete_upstream(uid: str, _: str = Depends(auth.require_master)):
 
     cfg = core.load_config()
     active = core.normalize_model(cfg.get("active_model"))
-    known = set(core.collect_models(new_items))
+    known = set(core.collect_models(new_items)) | set(DEEPSEEK_CLIENT_MODELS)
     if active != codex_sync.LOCAL_DIRECT and active not in known:
         # fall back + restore codex if leaving deepseek
         result = core._apply_active_model(DEFAULT_MODEL)
@@ -725,7 +744,10 @@ async def test_upstream(uid: str, _: str = Depends(auth.require_master)):
 
 @router.get("/api/pricing")
 async def get_pricing(_: str = Depends(auth.require_master)):
-    return {"pricing": core.load_pricing()}
+    pricing = core.load_pricing()
+    models = core.collect_client_models_for_availability()
+    extra = sorted(k for k in pricing if k not in models)
+    return {"pricing": pricing, "models": models + extra}
 
 
 @router.put("/api/pricing")

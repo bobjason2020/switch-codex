@@ -421,12 +421,13 @@
       try {
         const d = await api("/api/pricing");
         pricing = d.pricing || {};
+        pricingModels = d.models || Object.keys(pricing);
         renderPricingRows();
       } catch (e) { showMsg(e.message, false); }
     }
 
     function renderPricingRows() {
-      const models = [...new Set([DEFAULT_MODEL, ...knownModels, ...Object.keys(pricing)])];
+      const models = [...new Set([...(pricingModels || []), ...Object.keys(pricing)])];
       $("pricingRows").innerHTML = models.map((m) => {
         const p = pricing[m] || {};
         const val = (k) => (p[k] == null ? "" : p[k]);
@@ -745,7 +746,7 @@
       const mode = st.mode || "";
       let text, cls;
       if (mode === "local-direct") { text = "本机原配置"; cls = "ok"; }
-      else if (mode === "openai-all") { text = "openai-all（走 4100）"; cls = "ok"; }
+      else if (mode === "openai-all") { text = "openai（走 4100）"; cls = "ok"; }
       else if (mode === "deepseek") { text = (st.config_model || "deepseek") + "（走 4100）"; cls = "ok"; }
       else if (mode === "routing-only") { text = "仅路由（未改配置）"; cls = "disabled"; }
       else { text = "未配置"; cls = ""; }
@@ -771,7 +772,7 @@
       const mode = st.mode || "";
       let text, cls;
       if (mode === "local-direct") { text = "本机原配置"; cls = "ok"; }
-      else if (mode === "openai-all") { text = "openai-all（走 4100）"; cls = "ok"; }
+      else if (mode === "openai-all") { text = "openai（走 4100）"; cls = "ok"; }
       else if (mode === "deepseek") { text = (st.config_model || "deepseek") + "（走 4100）"; cls = "ok"; }
       else { text = "未配置"; cls = ""; }
       pill.className = "pill" + (cls ? " " + cls : "");
@@ -801,7 +802,7 @@
 
     $("btnApplyClaude").onclick = async () => {
       const v = ($("claudeModel").value || "local-direct").trim();
-      const isDeepseek = v !== "local-direct" && v !== "openai-all";
+      const isDeepseek = v !== "local-direct" && v !== DEFAULT_MODEL;
       const mode = v === "local-direct" ? "local-direct" : isDeepseek ? "deepseek" : "openai-all";
       const payload = { mode };
       if (mode === "deepseek") payload.model = v;
@@ -813,7 +814,7 @@
         const changes = (r.changes || []).map((x) => "· " + x).join("\n");
         const modeText =
           mode === "local-direct" ? "已恢复本机原配置" :
-          mode === "openai-all" ? "已配置走 4100（openai-all 池）" : "已配置走 4100（" + v + " 池）";
+          mode === "openai-all" ? "已配置走 4100（openai 池）" : "已配置走 4100（" + v + " 池）";
         showMsg("Claude Code：" + modeText + "\n" + changes + "\n请新开 Claude Code 会话使配置生效。", true);
         renderClaudeStatus();
         await refreshModels();
@@ -853,7 +854,7 @@
             : mode === "deepseek"
             ? "\nCodex: 已按官方规则写入 model/reasoning/catalog + models.json"
             : mode === "openai-all"
-              ? "\nCodex: 已配置走 4100（openai-all 池）+ auth.json"
+              ? "\nCodex: 已配置走 4100（openai 池）+ auth.json"
               : mode === "routing-only"
                 ? "\nCodex: 未改动（仅路由）"
                 : "";

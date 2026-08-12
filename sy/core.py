@@ -22,6 +22,9 @@ from sy.const import (
     DEFAULT_MODEL,
     DEFAULT_OPENAI_ALL_MODEL_MAP,
     DEFAULT_PROBE_INTERVAL_SEC,
+    DEEPSEEK_CLIENT_MODELS,
+    DEEPSEEK_DEFAULT_MODEL_MAP,
+    DEEPSEEK_POOL,
     PROBE_MULTIPLIER_THRESHOLD,
     env_host,
     env_port,
@@ -333,20 +336,16 @@ def light_for_multiplier(multiplier: Optional[float], ok: bool) -> str:
 
 
 def pool_for_client_model(client_model: str) -> str:
-    """把客户端模型名映射到拥有其上游的路由池。"""
+    """把客户端模型名映射到路由池。DeepSeek slug 统一进通用 deepseek 池。"""
     m = str(client_model or "").strip()
     if not m:
         return DEFAULT_MODEL
-    if codex_sync.is_deepseek_model(m) or "deepseek" in m.lower():
-        pools = collect_models()
-        # 精确池优先：deepseek-v4-pro 应路由到 deepseek-v4-pro 池，而不是第一个 deepseek 池。
-        for pool in pools:
-            if normalize_model(pool) == m:
-                return pool
-        for pool in pools:
-            if codex_sync.is_deepseek_model(pool) or "deepseek" in pool.lower():
-                return pool
-        return m
+    if m == DEEPSEEK_POOL or codex_sync.is_deepseek_model(m):
+        return DEEPSEEK_POOL
+    pools = collect_models()
+    for pool in pools:
+        if normalize_model(pool) == m:
+            return pool
     return DEFAULT_MODEL
 
 
@@ -359,6 +358,8 @@ def resolve_route_pool(
     active = normalize_model(active_model or load_config().get("active_model"))
     if active == codex_sync.LOCAL_DIRECT:
         return DEFAULT_MODEL
+    if active == DEEPSEEK_POOL or codex_sync.is_deepseek_model(active):
+        return DEEPSEEK_POOL
     return active
 
 
@@ -493,9 +494,10 @@ def collect_client_models_for_availability() -> list[str]:
         if not k or k == DEFAULT_MODEL:
             continue
         names.add(k)
-    for pool in collect_models():
-        if codex_sync.is_deepseek_model(pool) or "deepseek" in pool.lower():
-            names.add(pool)
+    if any(
+        normalize_model(u.get("model")) == DEEPSEEK_POOL for u in load_upstreams()
+    ):
+        names.update(DEEPSEEK_CLIENT_MODELS)
     head = [m for m in DEFAULT_CLIENT_MODELS if m in names]
     rest = sorted(n for n in names if n not in head)
     return head + rest
@@ -557,6 +559,8 @@ def normalize_model_map(value: Any) -> list[dict]:
 
 def default_model_map_for(model: Optional[str]) -> list[dict]:
     pool = normalize_model(model)
+    if pool == DEEPSEEK_POOL or codex_sync.is_deepseek_model(pool):
+        return normalize_model_map([dict(e) for e in DEEPSEEK_DEFAULT_MODEL_MAP])
     if pool == DEFAULT_MODEL:
         return normalize_model_map([dict(e) for e in DEFAULT_OPENAI_ALL_MODEL_MAP])
     return [{"model": pool, "actual": pool}]
@@ -886,7 +890,7 @@ def public_upstream(u: dict, health_map: Optional[dict[str, dict]] = None) -> di
 def _apply_active_model(active: str) -> dict[str, Any]:
     active = normalize_model(active)
     items = load_upstreams()
-    known = set(collect_models(items))
+    known = set(collect_models(items)) | set(DEEPSEEK_CLIENT_MODELS)
     if active != codex_sync.LOCAL_DIRECT and active not in known:
         raise HTTPException(
             status_code=400,
@@ -903,11 +907,27 @@ def _apply_active_model(active: str) -> dict[str, Any]:
     cfg["active_model"] = active
     save_config(cfg)
 
-    scoped = [
-        u
-        for u in items
-        if u.get("enabled", True) and normalize_model(u.get("model")) == active
-    ]
+    if active == DEEPSEEK_POOL:
+        scoped = [
+            u
+            for u in items
+            if u.get("enabled", True)
+            and normalize_model(u.get("model")) == DEEPSEEK_POOL
+        ]
+    elif codex_sync.is_deepseek_model(active):
+        scoped = [
+            u
+            for u in items
+            if u.get("enabled", True)
+            and normalize_model(u.get("model")) == DEEPSEEK_POOL
+            and upstream_supports_model(u, active)
+        ]
+    else:
+        scoped = [
+            u
+            for u in items
+            if u.get("enabled", True) and normalize_model(u.get("model")) == active
+        ]
     log.info(
         "active_model=%s scoped=%s codex_mode=%s",
         active,
@@ -926,9 +946,9 @@ def _apply_active_model(active: str) -> dict[str, Any]:
 def _apply_claude_config(mode: str, model: Optional[str] = None) -> dict[str, Any]:
     """Claude Code 配置同步：local-direct / openai-all / deepseek 三种模式。
 
-    deepseek 模式要求 model 为 DeepSeek slug；openai-all/deepseek 会把
-    active_model 同步进配置（保证 /v1/messages 按该模型路由），local-direct
-    直连本机原端点、不动 active_model。
+    deepseek 是整体模式：保留当前 DeepSeek 模型作为默认（无则 flash），
+    /model 在 Claude 内切换；openai-all/deepseek 会把 active_model 同步成
+    对应池名（保证 /v1/messages 按该池路由），local-direct 不动 active_model。
     """
     m = (mode or "").strip()
     if m not in ("local-direct", "openai-all", "deepseek"):
@@ -936,21 +956,19 @@ def _apply_claude_config(mode: str, model: Optional[str] = None) -> dict[str, An
             status_code=400,
             detail=f"未知 Claude 模式 {m!r}（仅支持 local-direct / openai-all / deepseek）",
         )
-    if m == "deepseek" and not codex_sync.is_deepseek_model(model or ""):
-        raise HTTPException(
-            status_code=400,
-            detail="deepseek 模式必须提供 DeepSeek 模型 slug（如 deepseek-v4-flash）",
-        )
+    slug = (model or "").strip() or None
+    if m == "deepseek" and not codex_sync.is_deepseek_model(slug or ""):
+        slug = claude_sync.current_deepseek_slug() or "deepseek-v4-flash"
 
     try:
-        result = claude_sync.sync_for_mode(m, model)
+        result = claude_sync.sync_for_mode(m, slug)
     except Exception as e:
-        log.exception("claude sync failed for mode=%s model=%s", m, model)
+        log.exception("claude sync failed for mode=%s model=%s", m, slug)
         raise HTTPException(status_code=500, detail=f"Claude Code 配置同步失败: {e}") from e
 
     active = normalize_model(load_config().get("active_model"))
     if m in ("openai-all", "deepseek"):
-        target = (model or "").strip() or claude_sync.DEFAULT_MODEL
+        target = DEFAULT_MODEL if m == "openai-all" else DEEPSEEK_POOL
         cfg = load_config()
         cfg["active_model"] = target
         save_config(cfg)

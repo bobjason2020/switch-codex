@@ -1,23 +1,33 @@
     function fillModelSelect(selectEl, selected, includeLocal) {
       const cur = selected || DEFAULT_MODEL;
-      const opts = new Set(knownModels);
-      opts.add(DEFAULT_MODEL);
-      if (includeLocal) opts.add(LOCAL_DIRECT);
-      if (cur) opts.add(cur);
-      const rest = [...opts].filter((m) => m !== DEFAULT_MODEL && m !== LOCAL_DIRECT).sort();
-      const list = includeLocal
-        ? [LOCAL_DIRECT, DEFAULT_MODEL, ...rest]
-        : [DEFAULT_MODEL, ...rest];
-      selectEl.innerHTML = list.map((m) => {
+      const custom = knownModels.filter((m) => m !== DEFAULT_MODEL && m !== DEEPSEEK_POOL).sort();
+      const opt = (m, tag) => {
         const n = modelCounts[m] || 0;
-        const sync = modelSync[m] || "";
-        const tag =
-          m === LOCAL_DIRECT ? "本机直连" :
-          m === DEFAULT_MODEL ? "4100 代理" :
-          (sync === "official-deepseek" ? "官方同步" : "仅路由");
         const label = `${m} · ${tag}` + (n ? ` · ${n} 启用` : "");
         return `<option value="${escapeHtml(m)}"${m === cur ? " selected" : ""}>${escapeHtml(label)}</option>`;
-      }).join("");
+      };
+      const parts = [];
+      if (includeLocal) parts.push(opt(LOCAL_DIRECT, "本机直连"));
+      parts.push(opt(DEFAULT_MODEL, "4100 代理"));
+      if (knownModels.includes(DEEPSEEK_POOL)) parts.push(opt(DEEPSEEK_POOL, "官方同步"));
+      custom.forEach((m) => parts.push(opt(m, modelSync[m] === "official-deepseek" ? "官方同步" : "仅路由")));
+      if (cur && cur !== DEFAULT_MODEL && cur !== LOCAL_DIRECT && cur !== DEEPSEEK_POOL && !knownModels.includes(cur)) {
+        parts.push(opt(cur, "仅路由"));
+      }
+      selectEl.innerHTML = parts.join("");
+    }
+
+    function fillPoolSelect(selectEl, selected) {
+      const cur = selected || DEFAULT_MODEL;
+      const opts = new Set(knownPools || [DEFAULT_MODEL, DEEPSEEK_POOL]);
+      opts.add(DEFAULT_MODEL);
+      opts.add(DEEPSEEK_POOL);
+      if (cur) opts.add(cur);
+      const rest = [...opts].filter((m) => m !== DEFAULT_MODEL && m !== DEEPSEEK_POOL).sort();
+      const ordered = [DEFAULT_MODEL, DEEPSEEK_POOL, ...rest];
+      selectEl.innerHTML = ordered.map((m) =>
+        `<option value="${escapeHtml(m)}"${m === cur ? " selected" : ""}>${escapeHtml(m)} · 池</option>`
+      ).join("");
     }
 
     function fillOptionSelect(id, emptyLabel, list, nameKey, countKey) {
@@ -81,8 +91,7 @@
     }
 
     function deepseekPool() {
-      const known = (knownModels || []).filter(isDeepseekPool);
-      return known[0] || "deepseek-v4-flash";
+      return DEEPSEEK_POOL;
     }
 
     function resolveTypeModel() {
@@ -112,7 +121,7 @@
     }
 
     function defaultModelMapForType(type) {
-      if (type === "openai-all") {
+      if (type === DEFAULT_MODEL) {
         return [
           { model: "gpt-5.6-luna", actual: "" },
           { model: "gpt-5.6-terra", actual: "" },
@@ -120,7 +129,7 @@
         ];
       }
       if (type === "deepseek") {
-        return [{ model: deepseekPool(), actual: "" }];
+        return DEEPSEEK_CLIENT_MODELS.map((m) => ({ model: m, actual: "" }));
       }
       return [];
     }
@@ -176,8 +185,8 @@
       $("chatCompletions").checked = false;
       $("anthropicMessages").checked = false;
       $("modelCustom").value = "";
-      fillModelSelect($("modelSelect"), DEFAULT_MODEL);
-      $("upstreamType").value = "openai-all";
+      fillPoolSelect($("modelSelect"), DEFAULT_MODEL);
+      $("upstreamType").value = DEFAULT_MODEL;
       syncUpstreamType();
     }
 
@@ -196,10 +205,10 @@
       $("chatCompletions").checked = u ? !!u.chat_completions : false;
       $("anthropicMessages").checked = u ? !!u.anthropic_messages : false;
       $("modelCustom").value = "";
-      fillModelSelect($("modelSelect"), u ? (u.model || DEFAULT_MODEL) : DEFAULT_MODEL);
+      fillPoolSelect($("modelSelect"), u ? (u.model || DEFAULT_MODEL) : DEFAULT_MODEL);
       let type = "custom";
-      if (!u) type = "openai-all";
-      else if (u.model === DEFAULT_MODEL) type = "openai-all";
+      if (!u) type = DEFAULT_MODEL;
+      else if (u.model === DEFAULT_MODEL) type = DEFAULT_MODEL;
       else if (isDeepseekPool(u.model)) type = "deepseek";
       $("upstreamType").value = type;
       renderModelMap(u ? u.model_map : defaultModelMapForType(type));
@@ -321,7 +330,7 @@
       if (authMustChange) { showChangePw(); return; }
       appBooted = true;
       fillModelSelect($("activeModel"), DEFAULT_MODEL, true);
-      fillModelSelect($("modelSelect"), DEFAULT_MODEL);
+      fillPoolSelect($("modelSelect"), DEFAULT_MODEL);
       checkHealth();
       refreshModels()
         .then(() => Promise.all([loadUpstreams(), loadOverview(), loadPricing()]))
@@ -331,7 +340,10 @@
     async function refreshModels() {
       const data = await api("/api/models");
       knownModels = (data.data || []).map((x) => x.model);
+      knownPools = (data.pools || []).map((x) => x.model);
       if (!knownModels.includes(DEFAULT_MODEL)) knownModels.unshift(DEFAULT_MODEL);
+      if (!knownPools.includes(DEFAULT_MODEL)) knownPools.unshift(DEFAULT_MODEL);
+      if (!knownPools.includes(DEEPSEEK_POOL)) knownPools.unshift(DEEPSEEK_POOL);
       modelCounts = {};
       modelSync = {};
       for (const x of data.data || []) {
@@ -342,7 +354,7 @@
       codexStatus = data.codex || {};
       claudeStatus = data.claude || {};
       fillModelSelect($("activeModel"), activeModel, true);
-      fillModelSelect($("modelSelect"), $("modelSelect").value || DEFAULT_MODEL);
+      fillPoolSelect($("modelSelect"), $("modelSelect").value || DEFAULT_MODEL);
       fillClaudeModelSelect();
       renderCodexStatus();
       renderClaudeStatus();
@@ -351,18 +363,16 @@
     function fillClaudeModelSelect() {
       const sel = $("claudeModel");
       if (!sel) return;
-      const opts = [];
-      for (const m of knownModels) {
-        if (m.startsWith("deepseek-")) opts.push(m);
-      }
       const mode = claudeStatus.mode || "";
       let cur = "local-direct";
-      if (mode === "openai-all") cur = "openai-all";
-      else if (mode === "deepseek") cur = claudeStatus.config_model || "deepseek-v4-flash";
-      const list = [["local-direct", "本机原配置"], ["openai-all", "openai-all"]];
-      for (const m of opts.sort()) list.push([m, m]);
-      if (!list.some((o) => o[0] === cur)) list.push([cur, cur]);
-      sel.innerHTML = list.map((o) =>
-        `<option value="${escapeHtml(o[0])}"${o[0] === cur ? " selected" : ""}>${escapeHtml(o[1])}</option>`
-      ).join("");
+      if (mode === "openai-all") cur = DEFAULT_MODEL;
+      else if (mode === "deepseek") cur = DEEPSEEK_POOL;
+      const parts = [
+        `<option value="local-direct"${cur === "local-direct" ? " selected" : ""}>本机原配置</option>`,
+        `<option value="${escapeHtml(DEFAULT_MODEL)}"${cur === DEFAULT_MODEL ? " selected" : ""}>${escapeHtml(DEFAULT_MODEL)}</option>`,
+      ];
+      parts.push(
+        `<option value="${escapeHtml(DEEPSEEK_POOL)}"${cur === DEEPSEEK_POOL ? " selected" : ""}>${escapeHtml(DEEPSEEK_POOL)}</option>`
+      );
+      sel.innerHTML = parts.join("");
     }

@@ -29,7 +29,7 @@ from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from sy.codex_sync import _router_master_key, is_deepseek_model
-from sy.const import provider_base_url
+from sy.const import DEEPSEEK_CLIENT_MODELS, provider_base_url
 
 log = logging.getLogger("switchyard.claude_sync")
 
@@ -40,9 +40,9 @@ ORIGINAL_DIR = BACKUP_DIR / "original"
 ORIGINAL_MANIFEST = ORIGINAL_DIR / "manifest.json"
 MANIFEST = BACKUP_DIR / "manifest.json"
 
-DEFAULT_MODEL = "openai-all"  # 与 codex_sync 一致
+DEFAULT_MODEL = "openai"  # 与 codex_sync 一致
 LOCAL_DIRECT = "local-direct"
-DEEPSEEK_KNOWN = {"deepseek-v4-flash", "deepseek-v4-pro"}  # 与 codex_sync 一致
+DEEPSEEK_KNOWN = set(DEEPSEEK_CLIENT_MODELS)  # 与 sy.const 保持单一事实源
 
 # 本模块只管理这些 env 键；settings.json 的其它内容必须原样保留
 MANAGED_ENV_KEYS = (
@@ -470,7 +470,7 @@ def sync_for_mode(mode: str, model_slug: Optional[str] = None) -> dict:
     m = (mode or "").strip()
     if m == LOCAL_DIRECT:
         return restore_local_original()
-    if m == DEFAULT_MODEL:
+    if m == DEFAULT_MODEL or m == "openai-all":
         return apply_openai_all()
     if m == "deepseek":
         if not is_deepseek_model(model_slug or ""):
@@ -514,3 +514,17 @@ def status() -> dict:
         "applied_at": man.get("applied_at"),
         "bridge": bridge,
     }
+
+
+def current_deepseek_slug() -> Optional[str]:
+    """读当前 Claude settings 里的 ANTHROPIC_MODEL；是 DeepSeek slug 才返回。"""
+    try:
+        if settings_path().exists():
+            obj = json.loads(settings_path().read_text(encoding="utf-8"))
+            env = obj.get("env") if isinstance(obj, dict) else None
+            model = env.get("ANTHROPIC_MODEL") if isinstance(env, dict) else None
+            if is_deepseek_model(model or ""):
+                return str(model)
+    except Exception:
+        log.warning("failed to read current claude deepseek slug", exc_info=True)
+    return None

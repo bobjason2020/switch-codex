@@ -42,8 +42,14 @@ ERROR_LOG_ATTEMPT_BODY_MAX = 2000
 LOG_STREAM_BUF_MAX = 4 * 1024 * 1024
 
 # 模型 / 探测
-DEFAULT_MODEL = "openai-all"
+DEFAULT_MODEL = "openai"
 LOCAL_DIRECT = "local-direct"
+# DeepSeek 通用路由池 + 池下两个并列客户端模型
+DEEPSEEK_POOL = "deepseek"
+DEEPSEEK_CLIENT_MODELS = ("deepseek-v4-flash", "deepseek-v4-pro")
+DEEPSEEK_DEFAULT_MODEL_MAP = [
+    {"model": m, "actual": m} for m in DEEPSEEK_CLIENT_MODELS
+]
 DEFAULT_PROBE_INTERVAL_SEC = 300
 PROBE_MULTIPLIER_THRESHOLD = 0.1
 DEFAULT_CLIENT_MODELS = ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol")

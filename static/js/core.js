@@ -1,10 +1,13 @@
-    const DEFAULT_MODEL = "openai-all";
+    const DEFAULT_MODEL = "openai";
     const LOCAL_DIRECT = "local-direct";
+    const DEEPSEEK_POOL = "deepseek";
+    const DEEPSEEK_CLIENT_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"];
     const PAGE_SIZE = 100;
     const $ = (id) => document.getElementById(id);
     const msg = $("msg");
 
     let knownModels = [DEFAULT_MODEL];
+    let knownPools = [DEFAULT_MODEL, DEEPSEEK_POOL];
     let activeModel = DEFAULT_MODEL;
     let modelCounts = {};
     let modelSync = {};
@@ -15,6 +18,7 @@
     let errOffset = 0;
     let errTotal = 0;
     let pricing = {};
+    let pricingModels = [];
 
     function showMsg(text, ok) {
       msg.className = "banner " + (ok ? "ok" : "err");

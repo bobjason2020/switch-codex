@@ -14,9 +14,9 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 import sy
-from sy import auth, codex_sync, core, db, probes
+from sy import auth, codex_sync, core, db, migrate_deepseek, probes
 from sy.api import router as api_router
-from sy.const import STATIC
+from sy.const import DEEPSEEK_POOL, STATIC
 from sy.proxy import router as proxy_router
 
 logging.basicConfig(
@@ -28,6 +28,7 @@ log = logging.getLogger("switchyard.app")
 # 初始化 SQLite 并导入旧 JSON/JSONL 数据、迁移旧库文件。
 db.init_db()
 db.migrate_legacy_data()
+migrate_deepseek.migrate()
 
 
 @asynccontextmanager
@@ -57,7 +58,15 @@ async def health():
     items = core.load_upstreams()
     active = core.normalize_model(cfg.get("active_model"))
     enabled = [u for u in items if u.get("enabled", True)]
-    scoped = [u for u in enabled if core.normalize_model(u.get("model")) == active]
+    scoped = [
+        u
+        for u in enabled
+        if core.normalize_model(u.get("model")) == active
+        or (
+            core.normalize_model(u.get("model")) == DEEPSEEK_POOL
+            and codex_sync.is_deepseek_model(active)
+        )
+    ]
     return {
         "status": "ok",
         "active_model": active,
