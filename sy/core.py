@@ -19,6 +19,7 @@ from sy import claude_sync, codex_sync, db, grok_sync, state, timeutil
 from sy.const import (
     CACHE_PRIORITY_TTL_SEC,
     DEFAULT_CLIENT_MODELS,
+    DEFAULT_MASTER_KEY,
     DEFAULT_MODEL,
     DEFAULT_OPENAI_ALL_MODEL_MAP,
     DEFAULT_PROBE_INTERVAL_SEC,
@@ -28,6 +29,7 @@ from sy.const import (
     GROK_CLIENT_MODELS,
     GROK_DEFAULT_MODEL_MAP,
     GROK_POOL,
+    MIN_REAL_COST,
     PROBE_MULTIPLIER_THRESHOLD,
     env_host,
     env_port,
@@ -54,7 +56,6 @@ def load_config() -> dict:
         cfg = {}
     probe = _normalize_probe_config(cfg.get("probe"))
     base = {
-        "master_key": None,
         "host": env_host(),
         "port": env_port(),
         "timeout_sec": 120,
@@ -68,6 +69,12 @@ def load_config() -> dict:
     cfg["probe"] = probe
     if not str(cfg.get("active_model") or "").strip():
         cfg["active_model"] = DEFAULT_MODEL
+    if not str(cfg.get("master_key") or "").strip():
+        cfg["master_key"] = DEFAULT_MASTER_KEY
+        try:
+            save_config(cfg)
+        except Exception:
+            log.exception("persist default master_key failed")
     return cfg
 
 
@@ -84,7 +91,7 @@ def save_config(cfg: dict) -> None:
 
 def public_config_default() -> dict:
     return {
-        "enabled": True,
+        "enabled": False,
         "public_url": "",
         "mode": "blacklist",
         "allow_loopback": True,
@@ -607,8 +614,11 @@ def upstream_request_model(
 
 def normalize_base_url(value: Optional[str]) -> str:
     raw = str(value or "").strip()
-    raw = re.sub(r"^(?:https?://)+", "", raw, flags=re.IGNORECASE)
-    raw = raw.rstrip("/")
+    if not raw:
+        return ""
+    if re.match(r"^https?://", raw, flags=re.IGNORECASE):
+        return raw.rstrip("/")
+    raw = re.sub(r"^(?:https?://)+", "", raw, flags=re.IGNORECASE).rstrip("/")
     if not raw:
         return ""
     return "https://" + raw
@@ -736,11 +746,13 @@ def save_pricing(pricing: dict) -> None:
 
 
 def pricing_for(pool: str, client_model: Optional[str] = None) -> dict:
-    fallback = {
+    empty = {
         "input_per_m": None,
         "output_per_m": None,
         "cache_read_per_m": None,
+        "cache_creation_per_m": None,
     }
+    fallback = dict(empty)
     seen: set[str] = set()
     for key in (client_model, pool):
         key = str(key or "").strip()
@@ -754,14 +766,11 @@ def pricing_for(pool: str, client_model: Optional[str] = None) -> dict:
             "input_per_m": _float_or_none(raw.get("input_per_m")),
             "output_per_m": _float_or_none(raw.get("output_per_m")),
             "cache_read_per_m": _float_or_none(raw.get("cache_read_per_m")),
+            "cache_creation_per_m": _float_or_none(raw.get("cache_creation_per_m")),
         }
         if current["input_per_m"] is not None and current["output_per_m"] is not None:
             return current
-        if fallback == {
-            "input_per_m": None,
-            "output_per_m": None,
-            "cache_read_per_m": None,
-        }:
+        if fallback == empty:
             fallback = current
     return fallback
 
@@ -777,16 +786,37 @@ def compute_cost_usd(entry: dict) -> Optional[float]:
     if inp is None or out is None:
         return None
     inp_n = int(input_tokens or 0)
-    cached = int(entry.get("cached_tokens") or 0)
-    uncached = max(inp_n - cached, 0)
-    cache_price = pr["cache_read_per_m"]
-    cached_price = cache_price if cache_price is not None else inp
+    cache_read = int(entry.get("cache_read_tokens") or 0)
+    cache_create = int(entry.get("cache_creation_tokens") or 0)
+    if cache_read == 0 and cache_create == 0:
+        cache_read = int(entry.get("cached_tokens") or 0)
+    uncached = max(inp_n - cache_read - cache_create, 0)
+    cache_read_price = pr["cache_read_per_m"]
+    if cache_read_price is None:
+        cache_read_price = inp
+    cache_create_price = pr.get("cache_creation_per_m")
+    if cache_create_price is None:
+        cache_create_price = inp
     cost = (
         uncached * inp
-        + cached * cached_price
+        + cache_read * cache_read_price
+        + cache_create * cache_create_price
         + int(output_tokens or 0) * out
     )
     return cost / 1_000_000
+
+
+def _apply_min_real_cost(raw: Any) -> Optional[float]:
+    """Apply NewAPI 1-quota floor so tiny grok bills don't round to $0."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return 0.0 if math.isfinite(value) and value == 0 else None
+    if value < MIN_REAL_COST:
+        value = MIN_REAL_COST
+    return round(value, 8)
 
 
 def compute_real_cost_cny(
@@ -800,7 +830,7 @@ def compute_real_cost_cny(
         return None
     if multiplier is None:
         multiplier = entry_multiplier(entry)
-    return round(cost_usd * multiplier, 8)
+    return _apply_min_real_cost(cost_usd * multiplier)
 
 
 def cost_breakdown(entry: dict) -> Optional[dict]:
@@ -813,10 +843,17 @@ def cost_breakdown(entry: dict) -> Optional[dict]:
     out = pr["output_per_m"]
     if inp is None or out is None:
         return None
-    cached = int(entry.get("cached_tokens") or 0)
-    uncached = max(int(input_tokens or 0) - cached, 0)
-    cache_price = pr["cache_read_per_m"]
-    cached_price = cache_price if cache_price is not None else inp
+    cache_read = int(entry.get("cache_read_tokens") or 0)
+    cache_create = int(entry.get("cache_creation_tokens") or 0)
+    if cache_read == 0 and cache_create == 0:
+        cache_read = int(entry.get("cached_tokens") or 0)
+    uncached = max(int(input_tokens or 0) - cache_read - cache_create, 0)
+    cache_read_price = pr["cache_read_per_m"]
+    if cache_read_price is None:
+        cache_read_price = inp
+    cache_create_price = pr.get("cache_creation_per_m")
+    if cache_create_price is None:
+        cache_create_price = inp
     out_n = int(output_tokens or 0)
     lines = [
         {
@@ -826,10 +863,16 @@ def cost_breakdown(entry: dict) -> Optional[dict]:
             "cost": round(uncached * inp / 1_000_000, 8),
         },
         {
-            "label": "缓存",
-            "tokens": cached,
-            "unit_price": cached_price,
-            "cost": round(cached * cached_price / 1_000_000, 8),
+            "label": "缓存读取",
+            "tokens": cache_read,
+            "unit_price": cache_read_price,
+            "cost": round(cache_read * cache_read_price / 1_000_000, 8),
+        },
+        {
+            "label": "缓存写入",
+            "tokens": cache_create,
+            "unit_price": cache_create_price,
+            "cost": round(cache_create * cache_create_price / 1_000_000, 8),
         },
         {
             "label": "输出",
@@ -840,7 +883,7 @@ def cost_breakdown(entry: dict) -> Optional[dict]:
     ]
     total = round(sum(line["cost"] for line in lines), 8)
     mult = entry_multiplier(entry)
-    real = round(total * mult, 8) if mult is not None else None
+    real = _apply_min_real_cost(total * mult) if mult is not None else None
     return {
         "rows": lines,
         "total": total,
@@ -851,11 +894,10 @@ def cost_breakdown(entry: dict) -> Optional[dict]:
 
 def compute_tps(entry: dict) -> Optional[float]:
     duration_ms = entry.get("duration_ms")
-    reasoning = entry.get("reasoning_tokens")
     output = entry.get("output_tokens")
-    if not duration_ms or (reasoning is None and output is None):
+    if not duration_ms or output is None:
         return None
-    tokens = int(reasoning or 0) + int(output or 0)
+    tokens = int(output or 0)
     if tokens <= 0:
         return None
     secs = float(duration_ms) / 1000.0
@@ -960,8 +1002,8 @@ def _apply_claude_config(mode: str, model: Optional[str] = None) -> dict[str, An
     """Claude Code 配置同步：local-direct / openai-all / deepseek 三种模式。
 
     deepseek 是整体模式：保留当前 DeepSeek 模型作为默认（无则 flash），
-    /model 在 Claude 内切换；openai-all/deepseek 会把 active_model 同步成
-    对应池名（保证 /v1/messages 按该池路由），local-direct 不动 active_model。
+    /model 在 Claude 内切换。不改全局 active_model（那是 Codex 卡共用的
+    路由默认池）；Claude 请求自带 model，pool_for_client_model 会归池。
     """
     m = (mode or "").strip()
     if m not in ("local-direct", "openai-all", "deepseek"):
@@ -979,16 +1021,9 @@ def _apply_claude_config(mode: str, model: Optional[str] = None) -> dict[str, An
         log.exception("claude sync failed for mode=%s model=%s", m, slug)
         raise HTTPException(status_code=500, detail=f"Claude Code 配置同步失败: {e}") from e
 
-    active = normalize_model(load_config().get("active_model"))
-    if m in ("openai-all", "deepseek"):
-        target = DEFAULT_MODEL if m == "openai-all" else DEEPSEEK_POOL
-        cfg = load_config()
-        cfg["active_model"] = target
-        save_config(cfg)
-        active = normalize_model(target)
     return {
         "mode": m,
-        "active_model": active,
+        "active_model": normalize_model(load_config().get("active_model")),
         "claude": claude_sync.status(),
         "changes": result.get("changes") or result.get("actions") or [],
     }

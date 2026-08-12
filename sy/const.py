@@ -35,6 +35,7 @@ def provider_base_url() -> str:
 
 # 日志 / 历史保留
 ERROR_LOG_RETENTION_HOURS = 24
+REQUEST_LOG_RETENTION_DAYS = 30
 AVAIL_HISTORY_RETENTION_DAYS = 14
 CACHE_PRIORITY_TTL_SEC = 3600
 ERROR_LOG_BODY_MAX_BYTES = 1024 * 1024
@@ -72,6 +73,9 @@ DEFAULT_OPENAI_ALL_MODEL_MAP = [
     {"model": "gpt-5.6-terra", "actual": ""},
     {"model": "gpt-5.6-sol", "actual": ""},
 ]
+
+# NewAPI 最低扣费：1 quota = $1 / 500000
+MIN_REAL_COST = 0.000002
 
 # NewAPI 倍率探测默认
 DEFAULT_NEWAPI_PROBE = {

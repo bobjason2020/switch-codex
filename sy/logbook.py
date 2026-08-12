@@ -9,17 +9,20 @@ from __future__ import annotations
 import json
 import logging
 import math
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from sy import core, db, timeutil
+
 from sy.const import (
     AVAIL_HISTORY_RETENTION_DAYS,
     COLOR_MID,
     COLOR_BAD,
     ERROR_LOG_BODY_MAX_BYTES,
     ERROR_LOG_RETENTION_HOURS,
+    REQUEST_LOG_RETENTION_DAYS,
 )
 
 log = logging.getLogger("switchyard.logbook")
@@ -29,6 +32,19 @@ _parse_ts = timeutil.parse_ts
 _timestamp_in_beijing = timeutil.timestamp_in_beijing
 _entry_in_beijing = timeutil.entry_in_beijing
 _iso_now = timeutil.iso_now
+_last_req_prune = 0.0
+
+
+def _maybe_prune_request_logs() -> None:
+    global _last_req_prune
+    now = time.time()
+    if now - _last_req_prune < 3600:
+        return
+    _last_req_prune = now
+    try:
+        db.prune_request_logs(REQUEST_LOG_RETENTION_DAYS)
+    except Exception:
+        log.exception("prune request logs failed")
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +202,7 @@ def _usage_numbers(usage: Optional[dict]) -> dict[str, Optional[int]]:
         input_tokens = (input_tokens or 0) + (cache_read or 0) + (cache_creation or 0)
     elif isinstance(detail_in, dict):
         cached_tokens = _token_int(detail_in.get("cached_tokens"))
+        cache_read = cached_tokens
     output_tokens = _token_int(usage.get("output_tokens"))
     # 思考：Anthropic/DeepSeek 可能顶层直接给 reasoning_tokens，OpenAI 风格在 details 里。
     reasoning_tokens = _token_int(usage.get("reasoning_tokens"))
@@ -197,10 +214,34 @@ def _usage_numbers(usage: Optional[dict]) -> dict[str, Optional[int]]:
     return {
         "input_tokens": input_tokens,
         "cached_tokens": cached_tokens,
+        "cache_read_tokens": cache_read,
+        "cache_creation_tokens": cache_creation,
         "output_tokens": output_tokens,
         "reasoning_tokens": reasoning_tokens,
         "total_tokens": total,
     }
+
+
+def _merge_usage(existing: Optional[dict], found: dict) -> dict:
+    """合并流式 usage：保留最早的 input/cache，覆盖最后的 output。"""
+    incoming = dict(found)
+    if not existing:
+        return incoming
+    merged = dict(existing)
+    in_t = _token_int(incoming.get("input_tokens"))
+    if in_t is not None and _token_int(merged.get("input_tokens")) is None:
+        merged["input_tokens"] = in_t
+    for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+        val = _token_int(incoming.get(key))
+        if val is not None and _token_int(merged.get(key)) is None:
+            merged[key] = val
+    out_t = _token_int(incoming.get("output_tokens"))
+    if out_t is not None:
+        merged["output_tokens"] = out_t
+    for key, val in incoming.items():
+        if key not in merged or merged.get(key) is None:
+            merged[key] = val
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -249,15 +290,27 @@ def _record_log(**fields: Any) -> None:
         "attempts": fields.pop("attempts", None),
         "input_tokens": _token_int(fields.pop("input_tokens", None)),
         "cached_tokens": _token_int(fields.pop("cached_tokens", None)),
+        "cache_read_tokens": _token_int(fields.pop("cache_read_tokens", None)),
+        "cache_creation_tokens": _token_int(fields.pop("cache_creation_tokens", None)),
         "output_tokens": _token_int(fields.pop("output_tokens", None)),
         "reasoning_tokens": _token_int(fields.pop("reasoning_tokens", None)),
         "total_tokens": _token_int(fields.pop("total_tokens", None)),
         "stream": bool(fields.pop("stream", False)),
         "is_probe": is_probe,
         "is_classifier": bool(fields.pop("is_classifier", False)),
+        "upstream_id": fields.pop("upstream_id", None),
     }
+    if not entry["upstream_id"] and upstream:
+        try:
+            for u in core.load_upstreams():
+                if str(u.get("name") or "") == str(upstream):
+                    entry["upstream_id"] = u.get("id")
+                    break
+        except Exception:
+            log.exception("backfill upstream_id failed")
     try:
         db.insert_request_log(entry)
+        _maybe_prune_request_logs()
     except Exception:
         log.exception("persist request log failed")
 
@@ -501,13 +554,13 @@ def _aggregate_stats(items: list[dict], now: datetime) -> dict:
         "total_output_tokens": sum_out,
         "total_reasoning_tokens": sum_reason,
         "total_cached_tokens": sum_cached,
-        "cache_hit_rate": round(sum_cached / sum_total, 4) if sum_total > 0 else None,
+        "cache_hit_rate": round(sum_cached / sum_in, 4) if sum_in > 0 else None,
         "total_tokens": sum_total,
         "avg_tps": (
             round(tps_tokens / tps_seconds, 1) if tps_tokens > 0 and tps_seconds > 0 else None
         ),
         "total_cost": round(total_cost, 4),
-        "total_real_cost_cny": round(total_real_cost_cny, 4),
+        "total_real_cost_cny": round(total_real_cost_cny, 8),
         "avg_duration_ms": round(sum(lat) / len(lat), 1) if lat else None,
         "avg_ttft_ms": round(sum(ttft_lat) / len(ttft_lat), 1) if ttft_lat else None,
         "last_24h": last_24h,

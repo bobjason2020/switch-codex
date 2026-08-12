@@ -3,11 +3,13 @@
 与 codex_sync / claude_sync 对称，为 Grok CLI（grok-build）提供两种模式：
   - local-direct：恢复项目介入前的本机原配置，Grok CLI 直连原端点；
   - grok：在 config.toml 写入受管模型段 [model."switchyard"]，指向本路由
-    4100 的 OpenAI Responses 兼容端点，并把 [models].default 设为该段。
+    4100 的 OpenAI Responses 兼容端点，并把 [models].default / web_search
+    都设为该段。
 
 Grok CLI 会把请求体 model 字段设为受管段的 model（grok-4.6 等客户端模型），
-路由端按 model_map 把 grok 客户端模型归入通用 grok 池。本模块只管理受管段与
-[models].default，config.toml 的其它内容（用户自定义模型、mcp_servers、ui、
+路由端按 model_map 把 grok 客户端模型归入通用 grok 池。本模块管理受管段、
+[models].default 与 [models].web_search（都指向受管段），并清掉浮生搜索相关
+段；config.toml 的其它内容（用户自定义模型、其余 mcp_servers、ui、
 marketplace 等）逐行原样保留。
 
 快照/恢复与 claude_sync 同风格：介入前一次性快照到 data/grok-backup/original，
@@ -46,11 +48,17 @@ MANIFEST = BACKUP_DIR / "manifest.json"
 LOCAL_DIRECT = "local-direct"
 GROK_KNOWN = set(GROK_CLIENT_MODELS)
 
-# 受管模型段的固定 key（显示名、指向 4100 的 Responses 端点、路由 master key）
+# 受管模型段的固定 key（显示名用客户端模型 id，指向 4100 的 Responses 端点、路由 master key）
 MANAGED_KEY = "switchyard"
-MANAGED_NAME = "Switch · grok"
+MANAGED_CONTEXT_WINDOW = 500000
 MANAGED_SECTION = f"model.{MANAGED_KEY}"
 MANAGED_BASE_URL = provider_base_url()
+
+# 切到 grok 池时一并清掉，避免从本机快照再把浮生搜索带回来
+DROPPED_SECTIONS = (
+    "model.grok-4.5-fusheng",
+    "mcp_servers.fusheng-search",
+)
 
 
 def grok_home() -> Path:
@@ -162,22 +170,34 @@ def current_grok_slug() -> Optional[str]:
     return None
 
 
+def _is_dropped_section(hdr: str) -> bool:
+    if hdr == MANAGED_SECTION or hdr.startswith(MANAGED_SECTION + "."):
+        return True
+    for prefix in DROPPED_SECTIONS:
+        if hdr == prefix or hdr.startswith(prefix + "."):
+            return True
+    return False
+
+
 def _managed_block(model_slug: str) -> list[str]:
     return [
         f'[model."{MANAGED_KEY}"]',
         f'model = "{model_slug}"',
-        f'name = "{MANAGED_NAME}"',
+        f'name = "{model_slug}"',
         f'base_url = "{MANAGED_BASE_URL}"',
         f'api_key = "{_router_master_key()}"',
         'api_backend = "responses"',
+        "supports_backend_search = true",
+        f"context_window = {MANAGED_CONTEXT_WINDOW}",
     ]
 
 
 def transform_config_toml(text: str, model_slug: str) -> tuple[str, list[str]]:
-    """写入受管段并把 [models].default 指向它。返回 (new_text, change_report)。
+    """写入受管段，并把 [models].default / web_search 都指向它。
 
-    除受管段和 [models].default 外逐行保留原文件；编辑前先整体解析校验，
-    损坏直接抛 RuntimeError，不做任何部分修改。
+    同时清掉浮生搜索模型段与 MCP。返回 (new_text, change_report)。
+    除上述受管字段外逐行保留原文件；编辑前先整体解析校验，损坏直接抛
+    RuntimeError，不做任何部分修改。
     """
     if text.strip():
         _parse_config(text)
@@ -190,6 +210,7 @@ def transform_config_toml(text: str, model_slug: str) -> tuple[str, list[str]]:
     cur_section = ""
     skip_section = False
     default_seen = False
+    web_search_seen = False
     models_seen = False
     i = 0
     n = len(lines)
@@ -203,9 +224,12 @@ def transform_config_toml(text: str, model_slug: str) -> tuple[str, list[str]]:
         if _is_section_header(line, depth, mlstate):
             hdr = _section_name(line)
             cur_section = hdr
-            skip_section = hdr == MANAGED_SECTION or hdr.startswith(MANAGED_SECTION + ".")
+            skip_section = _is_dropped_section(hdr)
             if skip_section:
-                report.append(f"移除受管段 [{hdr}]")
+                if hdr == MANAGED_SECTION or hdr.startswith(MANAGED_SECTION + "."):
+                    report.append(f"移除受管段 [{hdr}]")
+                else:
+                    report.append(f"移除浮生搜索段 [{hdr}]")
                 advance(line)
                 i += 1
                 continue
@@ -221,16 +245,19 @@ def transform_config_toml(text: str, model_slug: str) -> tuple[str, list[str]]:
             i += 1
             continue
 
-        # 只改写 [models] 段的 default 键（单行赋值）
+        # 只改写 [models] 段的 default / web_search（单行赋值）
         if cur_section == "models" and not mlstate and depth == 0:
             k = _key_of(line)
-            if k == "default" and "=" in line:
+            if k in ("default", "web_search") and "=" in line:
                 indent = line[: len(line) - len(line.lstrip())]
-                new_line = f'{indent}default = "{MANAGED_KEY}"'
+                new_line = f'{indent}{k} = "{MANAGED_KEY}"'
                 if new_line != line:
-                    report.append(f"改写 [models] default → {MANAGED_KEY}")
+                    report.append(f"改写 [models] {k} → {MANAGED_KEY}")
                 out.append(new_line)
-                default_seen = True
+                if k == "default":
+                    default_seen = True
+                else:
+                    web_search_seen = True
                 advance(line)
                 i += 1
                 continue
@@ -239,7 +266,12 @@ def transform_config_toml(text: str, model_slug: str) -> tuple[str, list[str]]:
         advance(line)
         i += 1
 
+    missing_models_keys: list[tuple[str, str]] = []
     if not default_seen:
+        missing_models_keys.append(("default", f"补全 [models] default = {MANAGED_KEY}"))
+    if not web_search_seen:
+        missing_models_keys.append(("web_search", f"补全 [models] web_search = {MANAGED_KEY}"))
+    if missing_models_keys:
         if models_seen:
             insert_at = None
             for idx, l in enumerate(out):
@@ -247,14 +279,19 @@ def transform_config_toml(text: str, model_slug: str) -> tuple[str, list[str]]:
                     insert_at = idx + 1
                     break
             if insert_at is not None:
-                out.insert(insert_at, f'default = "{MANAGED_KEY}"')
-                report.append(f"补全 [models] default = {MANAGED_KEY}")
+                for offset, (key, note) in enumerate(missing_models_keys):
+                    out.insert(insert_at + offset, f'{key} = "{MANAGED_KEY}"')
+                    report.append(note)
             else:
-                out.extend(["", "[models]", f'default = "{MANAGED_KEY}"'])
-                report.append(f"新增 [models] default = {MANAGED_KEY}")
+                out.extend(["", "[models]"])
+                for key, note in missing_models_keys:
+                    out.append(f'{key} = "{MANAGED_KEY}"')
+                    report.append(note.replace("补全", "新增", 1))
         else:
-            out.extend(["", "[models]", f'default = "{MANAGED_KEY}"'])
-            report.append(f"新增 [models] default = {MANAGED_KEY}")
+            out.extend(["", "[models]"])
+            for key, note in missing_models_keys:
+                out.append(f'{key} = "{MANAGED_KEY}"')
+                report.append(note.replace("补全", "新增", 1))
 
     # 移除受管段可能遗留尾部空行：先清空再追加，保证重复应用幂等
     while out and not out[-1].strip():

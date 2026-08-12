@@ -132,12 +132,12 @@
     }
     function fmtRealCost(v) {
       if (!hasValue(v)) return "";
-      const s = Number(v).toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+      const s = Number(v).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
       return "￥" + s;
     }
     function fmtTotalCny(v) {
       if (v == null) return "";
-      const s = Number(v).toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+      const s = Number(v).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
       return "￥" + s;
     }
     function feeCell(e) {

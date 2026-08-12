@@ -8,6 +8,7 @@ json / time / typing，不引入第三方库。
 from __future__ import annotations
 
 import json
+import math
 import time
 from typing import Any, Optional
 
@@ -35,9 +36,51 @@ def stop_reason_to_anthropic(reason: Optional[str]) -> str:
         return "end_turn"
     if reason == "tool_use":
         return "tool_use"
-    if reason == "max_output_tokens":
+    if reason in ("max_output_tokens", "incomplete"):
         return "max_tokens"
     return "end_turn"
+
+
+def infer_stop_reason(resp: dict) -> str:
+    """从 Responses 对象推断 Anthropic stop_reason。
+
+    优先显式 stop_reason；有 function_call 则 tool_use；
+    status=incomplete 则 max_tokens；否则 end_turn。
+    """
+    output = resp.get("output")
+    if isinstance(output, list) and any(
+        isinstance(item, dict) and item.get("type") == "function_call" for item in output
+    ):
+        return "tool_use"
+    explicit = resp.get("stop_reason")
+    if explicit:
+        return stop_reason_to_anthropic(str(explicit))
+    status = resp.get("status")
+    if status == "incomplete":
+        details = resp.get("incomplete_details")
+        if isinstance(details, dict) and details.get("reason"):
+            return stop_reason_to_anthropic(str(details.get("reason")))
+        return "max_tokens"
+    return "end_turn"
+
+
+def looks_like_classifier(body: dict) -> bool:
+    """Claude Code auto-mode 分类器：非流式 + max_tokens≤120 + 无 tools + 单条 user。"""
+    if body.get("stream"):
+        return False
+    if body.get("tools"):
+        return False
+    try:
+        max_tok = body.get("max_tokens")
+        if max_tok is None or int(max_tok) > 120:
+            return False
+    except (TypeError, ValueError):
+        return False
+    msgs = body.get("messages") or []
+    if not isinstance(msgs, list) or len(msgs) != 1:
+        return False
+    first = msgs[0]
+    return isinstance(first, dict) and first.get("role") == "user"
 
 
 def anthropic_error_response(status: int, message: str) -> dict:
@@ -66,7 +109,13 @@ def _parse_usage(usage: Any) -> tuple:
     text_tokens/audio_tokens → token_details → 顶层任一 int 字段兜底。
     """
     def _num(v: Any) -> Optional[int]:
-        return v if isinstance(v, int) else None
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float) and math.isfinite(v) and v >= 0:
+            return int(v)
+        return None
 
     if not isinstance(usage, dict):
         return 0, 0
@@ -139,8 +188,18 @@ def _tool_result_output(content: Any) -> str:
 
 
 def _content_blocks_to_input(role: str, blocks: list) -> list:
-    """Anthropic content blocks 列表 → responses input items 列表（顺序保持）。"""
+    """Anthropic content blocks → responses input items。
+
+    连续的 text/image 包装成一条 message；tool_use / tool_result 作为顶层 item。
+    """
     items: list[dict] = []
+    pending: list[dict] = []
+
+    def flush() -> None:
+        if pending:
+            items.append({"role": role, "content": list(pending)})
+            pending.clear()
+
     for block in blocks:
         if not isinstance(block, dict):
             continue
@@ -149,10 +208,30 @@ def _content_blocks_to_input(role: str, blocks: list) -> list:
             text = block.get("text")
             if not isinstance(text, str) or not text:
                 continue
-            items.append(
+            pending.append(
                 {"type": "output_text" if role == "assistant" else "input_text", "text": text}
             )
+        elif btype == "image":
+            src = block.get("source") if isinstance(block.get("source"), dict) else {}
+            stype = src.get("type")
+            if stype == "base64" and src.get("data"):
+                media = src.get("media_type") or "image/png"
+                pending.append(
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:{media};base64,{src['data']}",
+                    }
+                )
+            elif stype == "url" and src.get("url"):
+                pending.append({"type": "input_image", "image_url": src["url"]})
+        elif btype == "thinking":
+            text = block.get("thinking")
+            if isinstance(text, str) and text:
+                pending.append(
+                    {"type": "output_text" if role == "assistant" else "input_text", "text": text}
+                )
         elif btype == "tool_use":
+            flush()
             name = block.get("name")
             if not isinstance(name, str):
                 name = json.dumps(name, ensure_ascii=False) if name is not None else ""
@@ -168,6 +247,7 @@ def _content_blocks_to_input(role: str, blocks: list) -> list:
                 }
             )
         elif btype == "tool_result":
+            flush()
             items.append(
                 {
                     "type": "function_call_output",
@@ -175,7 +255,7 @@ def _content_blocks_to_input(role: str, blocks: list) -> list:
                     "output": _tool_result_output(block.get("content")),
                 }
             )
-        # thinking / redacted_thinking / image 等 block 类型：忽略
+    flush()
     return items
 
 
@@ -414,7 +494,7 @@ def responses_response_to_anthropic(resp: dict, request_body: dict) -> dict:
         "role": "assistant",
         "model": model,
         "content": content,
-        "stop_reason": stop_reason_to_anthropic(resp.get("stop_reason")),
+        "stop_reason": infer_stop_reason(resp),
         "stop_sequence": None,
         "usage": {"input_tokens": in_t, "output_tokens": out_t},
     }
@@ -605,6 +685,7 @@ class ResponsesSseToAnthropic:
         self._tool_index_by_call: dict[str, int] = {}
         self._item_index: dict[str, int] = {}
         self._tool_args: dict[str, str] = {}
+        self._closed_indexes: set[int] = set()
         self._input_tokens = 0
         self._output_chars = 0
 
@@ -842,16 +923,17 @@ class ResponsesSseToAnthropic:
         )
         return events
 
+    def _close_block(self, index: int) -> list[str]:
+        if index < 0 or index in self._closed_indexes:
+            return []
+        self._closed_indexes.add(index)
+        return [sse_event("content_block_stop", {"type": "content_block_stop", "index": index})]
+
     def _on_thinking_done(self, chunk: dict) -> list[str]:
         """reasoning_text.done / content_part.done(reasoning) → 结束 thinking 块（幂等）。"""
         events = self._ensure_message_start()
         if self._thinking_index >= 0:
-            events.append(
-                sse_event(
-                    "content_block_stop",
-                    {"type": "content_block_stop", "index": self._thinking_index},
-                )
-            )
+            events.extend(self._close_block(self._thinking_index))
             self._thinking_index = -1
         return events
 
@@ -867,10 +949,7 @@ class ResponsesSseToAnthropic:
         if itype == "message":
             if index < 0:
                 index = self._text_index
-            if index >= 0:
-                events.append(
-                    sse_event("content_block_stop", {"type": "content_block_stop", "index": index})
-                )
+            events.extend(self._close_block(index))
         elif itype == "function_call":
             call_id = item.get("call_id") or ""
             if index < 0:
@@ -878,17 +957,13 @@ class ResponsesSseToAnthropic:
             self.last_tool_arguments[call_id] = self._tool_args.get(
                 call_id, item.get("arguments") or ""
             )
-            if index >= 0:
-                events.append(
-                    sse_event("content_block_stop", {"type": "content_block_stop", "index": index})
-                )
+            events.extend(self._close_block(index))
         elif itype == "reasoning":
             if index < 0:
                 index = self._thinking_index
-            if index >= 0:
-                events.append(
-                    sse_event("content_block_stop", {"type": "content_block_stop", "index": index})
-                )
+            events.extend(self._close_block(index))
+            if index == self._thinking_index:
+                self._thinking_index = -1
         return events
 
     def _on_completed(self, chunk: dict) -> list[str]:
@@ -897,7 +972,9 @@ class ResponsesSseToAnthropic:
         resp = chunk.get("response")
         if not isinstance(resp, dict):
             resp = chunk
-        stop = stop_reason_to_anthropic(resp.get("stop_reason") or chunk.get("stop_reason"))
+        stop = infer_stop_reason(resp if isinstance(resp, dict) else chunk)
+        if stop == "end_turn" and chunk.get("stop_reason"):
+            stop = stop_reason_to_anthropic(chunk.get("stop_reason"))
         usage = resp.get("usage")
         if not isinstance(usage, dict):
             usage = chunk.get("usage")
@@ -905,20 +982,10 @@ class ResponsesSseToAnthropic:
         if not isinstance(usage, dict):
             usage = {}
             in_t = self._input_tokens
-            if not out_t:
-                out_t = self._output_chars
-        # 保留完整 usage（含 cache_creation/cache_read 等字段），供日志解析缓存/思考 token。
-        self.latest_usage = {
-            "input_tokens": in_t,
-            "output_tokens": out_t,
-            **{
-                k: v
-                for k, v in usage.items()
-                if k
-                in ("cache_creation_input_tokens", "cache_read_input_tokens", "reasoning_tokens")
-                and v is not None
-            },
-        }
+        # 保留完整 usage，不把字符数当 token。
+        self.latest_usage = dict(usage)
+        self.latest_usage["input_tokens"] = in_t or self._input_tokens
+        self.latest_usage["output_tokens"] = out_t
         events.append(
             sse_event(
                 "message_delta",
@@ -1011,7 +1078,9 @@ class ResponsesSseToAnthropic:
                 {
                     "type": "message_delta",
                     "delta": {"stop_reason": "end_turn"},
-                    "usage": {"output_tokens": self._output_chars},
+                    "usage": {
+                        "output_tokens": (self.latest_usage or {}).get("output_tokens") or 0
+                    },
                 },
             )
         )

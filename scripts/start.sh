@@ -32,7 +32,7 @@ fi
 "$ROOT/scripts/stop.sh" >/dev/null 2>&1 || true
 
 tmux new-session -d -s "$SESSION" \
-  "bash -lc 'cd \"$ROOT\" && exec \"$VENV/bin/uvicorn\" app:app --host $HOST --port $PORT 2>&1 | tee -a \"$LOG\"'"
+  "bash -lc 'cd \"$ROOT\" && exec \"$VENV/bin/uvicorn\" app:app --host \"$HOST\" --port \"$PORT\" 2>&1 | tee -a \"$LOG\"'"
 
 for i in $(seq 1 30); do
   if curl -fsS --max-time 2 "http://${HOST}:${PORT}/health" >/dev/null 2>&1; then

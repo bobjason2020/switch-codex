@@ -78,9 +78,11 @@ Anthropic 格式直接透传（零转换）；未开启的上游走 Anthropic �
 
 - **本机原配置**：恢复项目介入前的 `~/.grok/config.toml` 快照，Grok CLI 直连原 provider；
 - **grok 池**：在 `~/.grok/config.toml` 写入受管模型段 `[model."switchyard"]`（`base_url`
-  指向本路由、`api_backend = "responses"`、`api_key` 为路由 master key），并把
-  `[models].default` 切到该段。受管段的 `model` 为 grok 池下的客户端模型
-  （默认 `grok-4.6`），其它配置（用户自定义模型、mcp_servers、ui、marketplace 等）原样保留。
+  指向本路由、`api_backend = "responses"`、`api_key` 为路由 master key、`name` 与
+  `model` 均为客户端模型 id、`context_window = 500000`、开启 backend search），并把
+  `[models].default` / `[models].web_search` 都切到该段。同时清掉浮生搜索模型段与
+  `fusheng-search` MCP。受管段的 `model` 为 grok 池下的客户端模型（默认 `grok-4.6`），
+  其它配置（用户自定义模型、其余 mcp_servers、ui、marketplace 等）原样保留。
 
 grok 池的初始上游在服务启动时自动从 `~/.grok/config.toml` 中现有的自定义 grok 端点
 seed 一次（settings 键 `grok_pool_v1` 门控）；没有可用端点时会跳过并在下次启动重试，

@@ -49,7 +49,7 @@ async def auth_status(authorization: Optional[str] = Header(None)):
 
 @router.post("/api/login")
 async def login(body: LoginIn, request: Request):
-    client_ip = request.client.host if request.client else ""
+    client_ip = auth.login_client_ip(request)
     if auth._login_blocked(client_ip):
         raise HTTPException(status_code=429, detail="尝试次数过多，请 5 分钟后再试")
     cfg = auth.ensure_auth()
@@ -61,6 +61,12 @@ async def login(body: LoginIn, request: Request):
         "token": auth._new_session(),
         "must_change": bool(cfg.get("must_change")),
     }
+
+
+@router.post("/api/logout")
+async def logout(token: str = Depends(auth.require_session)):
+    auth.revoke_session(token)
+    return {"ok": True}
 
 
 @router.post("/api/change-password")
@@ -75,8 +81,9 @@ async def change_password(
     cfg["must_change"] = False
     cfg["changed_at"] = datetime.now().isoformat(timespec="seconds")
     auth.save_auth(cfg)
-    log.info("admin password changed")
-    return {"ok": True}
+    auth.revoke_all_sessions()
+    log.info("admin password changed; all sessions revoked")
+    return {"ok": True, "token": auth._new_session()}
 
 
 # ---------- models ----------
@@ -618,9 +625,10 @@ async def delete_upstream(uid: str, _: str = Depends(auth.require_master)):
     active = core.normalize_model(cfg.get("active_model"))
     known = set(core.collect_models(new_items)) | set(DEEPSEEK_CLIENT_MODELS)
     if active != codex_sync.LOCAL_DIRECT and active not in known:
-        # fall back + restore codex if leaving deepseek
-        result = core._apply_active_model(DEFAULT_MODEL)
-        return {"ok": True, "active_model_reset": result}
+        # 只改路由默认池，不触发 Codex 同步（删光上游时不应覆盖 ~/.codex）。
+        cfg["active_model"] = DEFAULT_MODEL
+        core.save_config(cfg)
+        return {"ok": True, "active_model_reset": {"active_model": DEFAULT_MODEL}}
     return {"ok": True}
 
 

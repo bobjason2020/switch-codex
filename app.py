@@ -14,9 +14,9 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 import sy
-from sy import auth, codex_sync, core, db, migrate_deepseek, migrate_grok, probes
+from sy import auth, core, db, migrate_deepseek, migrate_grok, probes
 from sy.api import router as api_router
-from sy.const import DEEPSEEK_POOL, STATIC
+from sy.const import STATIC
 from sy.proxy import router as proxy_router
 
 logging.basicConfig(
@@ -35,7 +35,7 @@ migrate_grok.migrate()
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
     auth.ensure_auth()
-    codex_sync.ensure_original_snapshot()
+    auth.restore_admin_sessions()
     probes._start_background_loops()
     yield
 
@@ -53,29 +53,25 @@ if (STATIC / "css").exists():
     app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
 
+@app.middleware("http")
+async def _security_headers(request, call_next):
+    resp = await call_next(request)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("X-XSS-Protection", "0")
+    path = request.url.path
+    if path.startswith("/api") or path.startswith("/v1"):
+        resp.headers.setdefault("Cache-Control", "no-store")
+    return resp
+
+
 @app.get("/health")
 async def health():
     cfg = core.load_config()
-    items = core.load_upstreams()
-    active = core.normalize_model(cfg.get("active_model"))
-    enabled = [u for u in items if u.get("enabled", True)]
-    scoped = [
-        u
-        for u in enabled
-        if core.normalize_model(u.get("model")) == active
-        or (
-            core.normalize_model(u.get("model")) == DEEPSEEK_POOL
-            and codex_sync.is_deepseek_model(active)
-        )
-    ]
     return {
         "status": "ok",
-        "active_model": active,
-        "upstreams_enabled": len(enabled),
-        "upstreams_in_scope": len(scoped),
-        "upstreams_total": len(items),
-        "models": core.collect_models(items),
-        "codex": codex_sync.status(),
+        "active_model": core.normalize_model(cfg.get("active_model")),
     }
 
 
@@ -96,6 +92,7 @@ _PAGE_PATHS = {
     "/settings/model",
     "/settings/pricing",
     "/settings/newapi",
+    "/settings/public",
 }
 
 

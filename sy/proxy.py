@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any, Optional
 
@@ -43,34 +44,175 @@ def _header_safe(value: Any) -> str:
 def _caller_ip(request: Request, trust_proxy_headers: bool = False) -> str:
     """Return the effective client IP.
 
-    By default only the socket peer is trusted. When ``trust_proxy_headers``
-    is explicitly enabled (e.g. behind Cloudflare / a trusted reverse proxy),
-    ``cf-connecting-ip`` and ``X-Forwarded-For`` are honored.
+    Cloudflare 经 loopback 进来时始终采用 cf-connecting-ip；
+    其它代理头仅在 ``trust_proxy_headers`` 打开时采信。
     """
+    peer = request.client.host if request.client else ""
+    cf = (request.headers.get("cf-connecting-ip") or "").strip()
+    if cf and (trust_proxy_headers or core.is_loopback_ip(peer)):
+        return cf.split(",")[0].strip()
     if trust_proxy_headers:
-        cf = (request.headers.get("cf-connecting-ip") or "").strip()
-        if cf:
-            return cf.split(",")[0].strip()
         xff = (request.headers.get("x-forwarded-for") or "").strip()
         if xff:
             parts = [p.strip() for p in xff.split(",") if p.strip()]
             if parts:
                 return parts[0]
-    return request.client.host if request.client else ""
+    return peer
 
 
 def _is_public_request(request: Request, trust_proxy_headers: bool = False) -> bool:
-    """Direct non-loopback peers are public; with proxy headers enabled,
-    loopback requests carrying trusted proxy headers are also public."""
+    """非回环对端、或 loopback+cf-connecting-ip（cloudflared）视为公网。"""
     peer = request.client.host if request.client else ""
+    cf = (request.headers.get("cf-connecting-ip") or "").strip()
+    if cf and core.is_loopback_ip(peer):
+        return True
     if peer and not core.is_loopback_ip(peer):
         return True
     if trust_proxy_headers:
         return bool(
-            (request.headers.get("cf-connecting-ip") or "").strip()
-            or (request.headers.get("x-forwarded-for") or "").strip()
+            cf or (request.headers.get("x-forwarded-for") or "").strip()
         )
     return False
+
+
+_SAFE_PATH_SEG = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _safe_responses_path(path: str, method: str) -> str:
+    """Sanitize /v1/responses/{path}；拒绝穿越。POST 只允许集合本身。"""
+    raw = (path or "").strip().strip("/")
+    if not raw:
+        return "responses"
+    if method == "POST":
+        raise HTTPException(status_code=405, detail="POST not allowed on nested responses path")
+    if ".." in raw or "\\" in raw or raw.startswith("/"):
+        raise HTTPException(status_code=400, detail="invalid path")
+    parts = [p for p in raw.split("/") if p]
+    if not parts or any(not _SAFE_PATH_SEG.fullmatch(p) for p in parts):
+        raise HTTPException(status_code=400, detail="invalid path")
+    return "responses/" + "/".join(parts)
+
+
+class _SseLineBuffer:
+    """按完整 UTF-8 行切 SSE，避免 chunk 截断 JSON。"""
+
+    def __init__(self) -> None:
+        self._buf = b""
+
+    def feed(self, chunk: bytes) -> list[str]:
+        if not chunk:
+            return []
+        self._buf += chunk
+        lines: list[str] = []
+        while True:
+            nl = self._buf.find(b"\n")
+            if nl < 0:
+                break
+            raw, self._buf = self._buf[:nl], self._buf[nl + 1 :]
+            if raw.endswith(b"\r"):
+                raw = raw[:-1]
+            lines.append(raw.decode("utf-8", errors="replace"))
+        return lines
+
+    def flush(self) -> Optional[str]:
+        if not self._buf:
+            return None
+        raw, self._buf = self._buf, b""
+        return raw.decode("utf-8", errors="replace")
+
+
+class _UsageSink:
+    def __init__(self) -> None:
+        self.usage: Optional[dict] = None
+
+    def feed_obj(self, obj: Any) -> None:
+        found = logbook._find_usage_in_obj(obj)
+        if found:
+            self.usage = logbook._merge_usage(self.usage, found)
+
+    def feed_line(self, line: str) -> None:
+        text = line.strip()
+        if text.startswith("data:"):
+            text = text[5:].strip()
+        if not text.startswith("{"):
+            return
+        try:
+            obj = json.loads(text)
+        except Exception:
+            return
+        self.feed_obj(obj)
+
+
+def _sse_error_bytes(message: str) -> bytes:
+    payload = json.dumps(
+        {"type": "error", "error": {"type": "api_error", "message": message}},
+        ensure_ascii=False,
+    )
+    return f"event: error\ndata: {payload}\n\n".encode("utf-8")
+
+
+def _stream_headers(base: dict[str, str]) -> dict[str, str]:
+    out = dict(base)
+    out.setdefault("Cache-Control", "no-cache")
+    out.setdefault("X-Accel-Buffering", "no")
+    return out
+
+
+async def _aclose_quietly(*objs: Any) -> None:
+    for obj in objs:
+        if obj is None:
+            continue
+        try:
+            await obj.aclose()
+        except Exception:
+            pass
+
+
+def _live_ok_payload(
+    client_model: str, route_pool: str, upstream: dict, status_code: int
+) -> dict:
+    mult = core.upstream_multiplier_value(upstream)
+    return {
+        "model": str(client_model),
+        "pool": route_pool,
+        "ok": True,
+        "light": core.light_for_multiplier(mult, True),
+        "multiplier": mult,
+        "upstream": upstream.get("name"),
+        "upstream_id": upstream.get("id"),
+        "status_code": status_code,
+        "duration_ms": None,
+        "checked_at": _iso_now(),
+        "attempts": 1,
+        "attempt_detail": [],
+        "error": None,
+        "source": "live-request",
+    }
+
+
+async def _kick_recascade(
+    client_model: Optional[str],
+    failed_ids: set[str],
+    timeout: float,
+) -> None:
+    if not client_model:
+        return
+
+    async def _run() -> None:
+        try:
+            await probes._cascade_probe_model(
+                str(client_model),
+                timeout=min(timeout, 30.0),
+                record_log=True,
+                exclude_ids=set(failed_ids),
+            )
+        except Exception:
+            log.exception("background re-cascade failed model=%s", client_model)
+
+    try:
+        asyncio.create_task(_run())
+    except Exception:
+        log.exception("schedule re-cascade failed model=%s", client_model)
 
 
 def _build_upstream_url(base_url: str, path_suffix: str) -> str:
@@ -143,6 +285,8 @@ async def _forward_once(
         headers["anthropic-version"] = (
             extra_headers.get("anthropic-version") or "2023-06-01"
         )
+        if extra_headers.get("anthropic-beta"):
+            headers["anthropic-beta"] = extra_headers["anthropic-beta"]
     else:
         headers["Authorization"] = f"Bearer {upstream['api_key']}"
         for k in ("accept", "openai-beta"):
@@ -178,12 +322,16 @@ async def proxy_responses(
     is_public_request = _is_public_request(request, trust_proxy_headers)
     body = await request.body()
     content_type = request.headers.get("content-type", "application/json")
-    extra = {k.lower(): v for k, v in request.headers.items() if k.lower() in ("accept", "openai-beta")}
+    extra = {
+        k.lower(): v
+        for k, v in request.headers.items()
+        if k.lower() in ("accept", "openai-beta", "anthropic-beta")
+    }
     req_body, req_body_len, req_body_trunc = logbook._request_body_for_log(body)
 
-    path_suffix = "responses" if not path else f"responses/{path}"
-    log_path = f"/v1/responses/{path}" if path else "/v1/responses"
     method = request.method.upper()
+    path_suffix = _safe_responses_path(path, method)
+    log_path = f"/v1/responses/{path}" if path else "/v1/responses"
 
     # client model + stream + reasoning effort if present (passthrough — no rewrite)
     client_model = None
@@ -220,6 +368,7 @@ async def proxy_responses(
         duration_ms: Optional[float] = None,
         ttft_ms: Optional[float] = None,
         endpoint: Optional[str] = None,
+        upstream_id: Optional[str] = None,
     ) -> None:
         logbook._record_log(
             client_ip=client_ip,
@@ -231,6 +380,7 @@ async def proxy_responses(
             client_model=client_model,
             reasoning_effort=reasoning_effort,
             upstream=upstream,
+            upstream_id=upstream_id,
             upstream_url=url,
             multiplier=multiplier,
             status=status,
@@ -318,8 +468,9 @@ async def proxy_responses(
     )
 
     errors: list[dict] = []
-    client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+    client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
     idx = 0
+    auth_failovers = 0
 
     try:
         while idx < len(candidates):
@@ -356,7 +507,6 @@ async def proxy_responses(
                         "failover": True,
                     }
                 )
-                # Preferred/availability winner failed → re-cascade once.
                 if (
                     not cascaded_once
                     and client_model
@@ -364,33 +514,17 @@ async def proxy_responses(
                     and upstream.get("name") == prefer_name
                 ):
                     cascaded_once = True
-                    probe_timeout = min(timeout, 30.0)
                     log.info(
                         "re-cascade after connection fail model=%s exclude=%s",
                         client_model,
                         list(failed_ids),
                     )
-                    try:
-                        avail = await probes._cascade_probe_model(
-                            str(client_model),
-                            timeout=probe_timeout,
-                            record_log=True,
-                            exclude_ids=set(failed_ids),
-                        )
-                    except Exception:
-                        log.exception("re-cascade failed model=%s", client_model)
-                        avail = None
-                    if avail and avail.get("ok"):
-                        candidates = core.order_candidates_for_model(
-                            client_model, route_pool, exclude_ids=set(failed_ids)
-                        )
-                        prefer_name = candidates[0].get("name") if candidates else None
-                        idx = 0
-                        log.info(
-                            "re-cascade winner=%s remaining=%s",
-                            prefer_name,
-                            [u.get("name") for u in candidates],
-                        )
+                    await _kick_recascade(client_model, failed_ids, timeout)
+                    candidates = core.order_candidates_for_model(
+                        client_model, route_pool, exclude_ids=set(failed_ids)
+                    )
+                    prefer_name = candidates[0].get("name") if candidates else None
+                    idx = 0
                 continue
 
             upstream_url = str(resp.request.url) if resp.request is not None else ""
@@ -402,28 +536,6 @@ async def proxy_responses(
                     umodel,
                     resp.status_code,
                 )
-                # Refresh availability cache with the live winner.
-                if client_model:
-                    mult = core.upstream_multiplier_value(upstream)
-                    probes._set_model_availability(
-                        str(client_model),
-                        {
-                            "model": str(client_model),
-                            "pool": route_pool,
-                            "ok": True,
-                            "light": core.light_for_multiplier(mult, True),
-                            "multiplier": mult,
-                            "upstream": upstream.get("name"),
-                            "upstream_id": upstream.get("id"),
-                            "status_code": resp.status_code,
-                            "duration_ms": None,
-                            "checked_at": _iso_now(),
-                            "attempts": 1,
-                            "attempt_detail": [],
-                            "error": None,
-                            "source": "live-request",
-                        },
-                    )
                 arrived_ms = (time.perf_counter() - t0) * 1000.0
                 convert_mode = bool(upstream.get("chat_completions"))
                 out_ct = resp.headers.get("content-type", "")
@@ -441,7 +553,8 @@ async def proxy_responses(
                         conv=converter,
                         arrived=arrived_ms,
                     ):
-                        buf = bytearray()
+                        sink = _UsageSink()
+                        sse_buf = _SseLineBuffer()
                         stream_error = None
                         client_disconnect = False
                         first_ms = None
@@ -451,25 +564,32 @@ async def proxy_responses(
                                     first_ms = (time.perf_counter() - t0) * 1000.0
                                 if not chunk:
                                     continue
-                                if len(buf) < LOG_STREAM_BUF_MAX:
-                                    buf.extend(chunk)
-                                text = chunk.decode("utf-8", errors="replace")
-                                for line in text.splitlines():
-                                    line = line.strip()
-                                    if line.startswith("data:"):
-                                        data = line[5:].strip()
-                                        if data == "[DONE]":
-                                            events = conv.finalize()
-                                        elif data.startswith("{"):
-                                            try:
-                                                obj = json.loads(data)
-                                            except Exception:
-                                                continue
-                                            events = conv.handle_chunk(obj)
-                                        else:
+                                for line in sse_buf.feed(chunk):
+                                    stripped = line.strip()
+                                    if not stripped.startswith("data:"):
+                                        continue
+                                    data = stripped[5:].strip()
+                                    if data == "[DONE]":
+                                        events = conv.finalize()
+                                    elif data.startswith("{"):
+                                        try:
+                                            obj = json.loads(data)
+                                        except Exception:
                                             continue
-                                        for ev in events:
-                                            yield ev.encode("utf-8")
+                                        sink.feed_obj(obj)
+                                        events = conv.handle_chunk(obj)
+                                    else:
+                                        continue
+                                    for ev in events:
+                                        yield ev.encode("utf-8")
+                            leftover = sse_buf.flush()
+                            if leftover and leftover.strip().startswith("data:"):
+                                data = leftover.strip()[5:].strip()
+                                if data.startswith("{"):
+                                    try:
+                                        sink.feed_obj(json.loads(data))
+                                    except Exception:
+                                        pass
                             if not conv.is_completed():
                                 for ev in conv.finalize():
                                     yield ev.encode("utf-8")
@@ -483,39 +603,44 @@ async def proxy_responses(
                             except Exception:
                                 pass
                         finally:
-                            await r.aclose()
-                            await c.aclose()
+                            await _aclose_quietly(r, c)
                             stream_err_log_id = None
-                            if not client_disconnect:
-                                if stream_error or not conv.is_completed():
-                                    reason = stream_error or "stream ended without response.completed"
-                                    stream_err_log_id = record_error(
-                                        status=r.status_code,
-                                        error=reason,
-                                        attempts=list(errors),
-                                    )
-                            status = r.status_code
-                            usage = conv.latest_usage or logbook._extract_usage(bytes(buf))
+                            ok = not stream_error and conv.is_completed()
+                            if not client_disconnect and not ok:
+                                reason = stream_error or "stream ended without response.completed"
+                                stream_err_log_id = record_error(
+                                    status=r.status_code,
+                                    error=reason,
+                                    attempts=list(errors),
+                                )
+                            if ok and client_model:
+                                probes._set_model_availability(
+                                    str(client_model),
+                                    _live_ok_payload(
+                                        str(client_model), route_pool, up, r.status_code
+                                    ),
+                                )
                             record(
-                                status=status,
+                                status=r.status_code,
                                 upstream=up.get("name"),
                                 url=uurl,
                                 multiplier=core.upstream_multiplier_value(up),
                                 error_log_id=stream_err_log_id,
                                 attempts=list(errors) if errors else None,
-                                usage=usage,
+                                usage=conv.latest_usage or sink.usage,
                                 duration_ms=(time.perf_counter() - t0) * 1000.0,
                                 ttft_ms=first_ms if first_ms is not None else arrived,
                                 endpoint="chat",
+                                upstream_id=up.get("id"),
                             )
 
-                    out_headers = {
+                    out_headers = _stream_headers({
                         "content-type": "text/event-stream",
                         "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
                         "x-switch-codex-pool": _header_safe(umodel),
                         "x-switch-codex-route-pool": _header_safe(route_pool),
                         "x-switch-codex-active-model": _header_safe(active),
-                    }
+                    })
                     if client_model is not None:
                         out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
                     return StreamingResponse(
@@ -548,6 +673,13 @@ async def proxy_responses(
                     out = convert.chat_response_to_responses(chat_obj)
                     out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8")
                     usage = logbook._extract_usage(out_bytes)
+                    if client_model:
+                        probes._set_model_availability(
+                            str(client_model),
+                            _live_ok_payload(
+                                str(client_model), route_pool, upstream, 200
+                            ),
+                        )
                     record(
                         status=200,
                         upstream=upstream.get("name"),
@@ -558,6 +690,7 @@ async def proxy_responses(
                         duration_ms=(time.perf_counter() - t0) * 1000.0,
                         ttft_ms=arrived_ms,
                         endpoint="chat",
+                        upstream_id=upstream.get("id"),
                     )
                     out_headers = {
                         "content-type": "application/json",
@@ -583,7 +716,8 @@ async def proxy_responses(
                     uurl=upstream_url,
                     arrived=arrived_ms,
                 ):
-                    buf = bytearray()
+                    sink = _UsageSink()
+                    sse_buf = _SseLineBuffer()
                     stream_error = None
                     client_disconnect = False
                     first_ms = None
@@ -592,39 +726,52 @@ async def proxy_responses(
                             if first_ms is None:
                                 first_ms = (time.perf_counter() - t0) * 1000.0
                             if chunk:
-                                if len(buf) < LOG_STREAM_BUF_MAX:
-                                    buf.extend(chunk)
+                                for line in sse_buf.feed(chunk):
+                                    sink.feed_line(line)
                                 yield chunk
                     except asyncio.CancelledError:
                         client_disconnect = True
                         raise
                     except Exception as e:
                         stream_error = f"stream aborted: {e}"
-                        raise
+                        try:
+                            yield _sse_error_bytes(str(e))
+                        except Exception:
+                            pass
                     finally:
-                        await r.aclose()
-                        await c.aclose()
+                        leftover = sse_buf.flush()
+                        if leftover:
+                            sink.feed_line(leftover)
+                        await _aclose_quietly(r, c)
                         stream_err_log_id = None
+                        ok = stream_error is None
                         if stream_error and not client_disconnect:
                             stream_err_log_id = record_error(
                                 status=r.status_code,
                                 error=stream_error,
                                 attempts=list(errors),
                             )
-                        status = r.status_code
+                        if ok and not client_disconnect and client_model:
+                            probes._set_model_availability(
+                                str(client_model),
+                                _live_ok_payload(
+                                    str(client_model), route_pool, up, r.status_code
+                                ),
+                            )
                         record(
-                            status=status,
+                            status=r.status_code,
                             upstream=up.get("name"),
                             url=uurl,
                             multiplier=core.upstream_multiplier_value(up),
                             error_log_id=stream_err_log_id,
                             attempts=list(errors) if errors else None,
-                            usage=logbook._extract_usage(bytes(buf)),
+                            usage=sink.usage,
                             duration_ms=(time.perf_counter() - t0) * 1000.0,
                             ttft_ms=first_ms if first_ms is not None else arrived,
+                            upstream_id=up.get("id"),
                         )
 
-                out_headers = {}
+                out_headers = _stream_headers({})
                 ct = resp.headers.get("content-type")
                 if ct:
                     out_headers["content-type"] = ct
@@ -649,6 +796,12 @@ async def proxy_responses(
                 or resp.status_code in FAILOVER_STATUS
                 or resp.status_code >= 500
             )
+            if resp.status_code in (401, 403):
+                if auth_failovers >= 1:
+                    failover = False
+                else:
+                    auth_failovers += 1
+                    failover = True
             log.warning(
                 "upstream=%s status=%s failover=%s body=%s",
                 upstream.get("name"),
@@ -817,7 +970,7 @@ async def proxy_anthropic_messages(
     extra = {
         k.lower(): v
         for k, v in request.headers.items()
-        if k.lower() in ("accept", "openai-beta", "anthropic-version")
+        if k.lower() in ("accept", "openai-beta", "anthropic-version", "anthropic-beta")
     }
 
     log_path = "/v1/messages"
@@ -921,7 +1074,7 @@ async def proxy_anthropic_messages(
     reasoning_effort = anthropic._resolve_reasoning_effort(j)
     # Claude Code auto-mode 分类器：非流式 + 无 effort 信号。强制 low（分类
     # 判定用不到高强度思考，省延迟省 token）+ 打标，便于日志区分主对话流。
-    is_classifier = (not stream) and reasoning_effort is None
+    is_classifier = anthropic.looks_like_classifier(j)
     if is_classifier:
         reasoning_effort = "low"
     req_payload = anthropic.anthropic_body_to_responses(j)
@@ -986,8 +1139,9 @@ async def proxy_anthropic_messages(
     )
 
     errors: list[dict] = []
-    client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+    client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
     idx = 0
+    auth_failovers = 0
 
     try:
         while idx < len(candidates):
@@ -1039,7 +1193,6 @@ async def proxy_anthropic_messages(
                         "failover": True,
                     }
                 )
-                # Preferred/availability winner failed → re-cascade once.
                 if (
                     not cascaded_once
                     and client_model
@@ -1047,33 +1200,17 @@ async def proxy_anthropic_messages(
                     and upstream.get("name") == prefer_name
                 ):
                     cascaded_once = True
-                    probe_timeout = min(timeout, 30.0)
                     log.info(
                         "re-cascade after connection fail model=%s exclude=%s",
                         client_model,
                         list(failed_ids),
                     )
-                    try:
-                        avail = await probes._cascade_probe_model(
-                            str(client_model),
-                            timeout=probe_timeout,
-                            record_log=True,
-                            exclude_ids=set(failed_ids),
-                        )
-                    except Exception:
-                        log.exception("re-cascade failed model=%s", client_model)
-                        avail = None
-                    if avail and avail.get("ok"):
-                        candidates = core.order_candidates_for_model(
-                            client_model, route_pool, exclude_ids=set(failed_ids)
-                        )
-                        prefer_name = candidates[0].get("name") if candidates else None
-                        idx = 0
-                        log.info(
-                            "re-cascade winner=%s remaining=%s",
-                            prefer_name,
-                            [u.get("name") for u in candidates],
-                        )
+                    await _kick_recascade(client_model, failed_ids, timeout)
+                    candidates = core.order_candidates_for_model(
+                        client_model, route_pool, exclude_ids=set(failed_ids)
+                    )
+                    prefer_name = candidates[0].get("name") if candidates else None
+                    idx = 0
                 continue
 
             upstream_url = str(resp.request.url) if resp.request is not None else ""
@@ -1085,28 +1222,6 @@ async def proxy_anthropic_messages(
                     umodel,
                     resp.status_code,
                 )
-                # Refresh availability cache with the live winner.
-                if client_model:
-                    mult = core.upstream_multiplier_value(upstream)
-                    probes._set_model_availability(
-                        str(client_model),
-                        {
-                            "model": str(client_model),
-                            "pool": route_pool,
-                            "ok": True,
-                            "light": core.light_for_multiplier(mult, True),
-                            "multiplier": mult,
-                            "upstream": upstream.get("name"),
-                            "upstream_id": upstream.get("id"),
-                            "status_code": resp.status_code,
-                            "duration_ms": None,
-                            "checked_at": _iso_now(),
-                            "attempts": 1,
-                            "attempt_detail": [],
-                            "error": None,
-                            "source": "live-request",
-                        },
-                    )
                 arrived_ms = (time.perf_counter() - t0) * 1000.0
                 out_ct = resp.headers.get("content-type", "")
 
@@ -1489,6 +1604,12 @@ async def proxy_anthropic_messages(
                 or resp.status_code in FAILOVER_STATUS
                 or resp.status_code >= 500
             )
+            if resp.status_code in (401, 403):
+                if auth_failovers >= 1:
+                    failover = False
+                else:
+                    auth_failovers += 1
+                    failover = True
             log.warning(
                 "upstream=%s status=%s failover=%s body=%s",
                 upstream.get("name"),

@@ -350,6 +350,13 @@ def delete_admin_session(token: str) -> None:
         conn.commit()
 
 
+def delete_all_admin_sessions() -> None:
+    with _lock:
+        conn = _get_conn()
+        conn.execute("DELETE FROM admin_sessions")
+        conn.commit()
+
+
 def purge_expired_admin_sessions(before_iso: str) -> int:
     with _lock:
         conn = _get_conn()
@@ -645,6 +652,19 @@ def clear_error_logs() -> None:
         conn = _get_conn()
         conn.execute("DELETE FROM error_logs")
         conn.commit()
+
+
+def prune_request_logs(days: int) -> int:
+    cutoff = (datetime.now(BEIJING_TZ) - timedelta(days=days)).isoformat(
+        timespec="milliseconds"
+    )
+    with _lock:
+        conn = _get_conn()
+        cur = conn.execute(
+            "DELETE FROM request_logs WHERE ts < ?", (cutoff,)
+        )
+        conn.commit()
+    return cur.rowcount
 
 
 def prune_error_logs(hours: int) -> int:

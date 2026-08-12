@@ -16,7 +16,13 @@ from fastapi import Header, HTTPException
 from pydantic import BaseModel, Field
 
 from sy import core, db
-from sy.const import DEFAULT_ADMIN_PASSWORD, LOGIN_MAX_FAILURES, LOGIN_WINDOW_MINUTES, SESSION_TTL_DAYS
+from sy.const import (
+    DEFAULT_ADMIN_PASSWORD,
+    DEFAULT_MASTER_KEY,
+    LOGIN_MAX_FAILURES,
+    LOGIN_WINDOW_MINUTES,
+    SESSION_TTL_DAYS,
+)
 
 log = logging.getLogger("switchyard.auth")
 
@@ -185,13 +191,67 @@ def require_master(authorization: Optional[str] = Header(None)) -> str:
     return token
 
 
-def require_client_key(authorization: Optional[str] = Header(None)) -> str:
+def _ensure_master_key() -> str:
+    """空/缺失 master_key 时回写内置默认值，不生成新 key。"""
     cfg = core.load_config()
-    master = cfg.get("master_key") or ""
+    master = str(cfg.get("master_key") or "").strip()
+    if master:
+        return master
+    cfg["master_key"] = DEFAULT_MASTER_KEY
+    try:
+        core.save_config(cfg)
+    except Exception:
+        log.exception("persist default master_key failed")
+    return DEFAULT_MASTER_KEY
+
+
+def _keys_equal(left: str, right: str) -> bool:
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    if len(left) != len(right):
+        secrets.compare_digest(right, right)
+        return False
+    return secrets.compare_digest(left, right)
+
+
+def require_client_key(authorization: Optional[str] = Header(None)) -> str:
+    master = _ensure_master_key()
     token = _bearer_token(authorization)
-    if token != master:
+    if not token or not _keys_equal(token, master):
         raise HTTPException(status_code=401, detail="Invalid client key")
     return token
+
+
+def revoke_session(token: str) -> None:
+    if not token:
+        return
+    with _sessions_lock:
+        _sessions.pop(token, None)
+    try:
+        db.delete_admin_session(token)
+    except Exception:
+        log.exception("revoke admin session failed")
+
+
+def revoke_all_sessions() -> None:
+    with _sessions_lock:
+        _sessions.clear()
+    try:
+        db.delete_all_admin_sessions()
+    except Exception:
+        log.exception("revoke all admin sessions failed")
+
+
+def login_client_ip(request) -> str:
+    """登录限流按 Cloudflare 真实 IP，其次才用 socket 对端。"""
+    try:
+        cf = (request.headers.get("cf-connecting-ip") or "").strip()
+    except Exception:
+        cf = ""
+    if cf:
+        return cf.split(",")[0].strip()
+    client = getattr(request, "client", None)
+    return client.host if client else ""
 
 
 class LoginIn(BaseModel):
