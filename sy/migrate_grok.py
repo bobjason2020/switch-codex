@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import tomllib
 import uuid
 from pathlib import Path
@@ -33,8 +32,8 @@ LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 def _grok_config_path() -> Path:
-    home = Path(os.environ.get("GROK_HOME") or (Path.home() / ".grok")).expanduser()
-    return home / "config.toml"
+    # 一次性 seed 只读默认 ~/.grok，忽略 GROK_HOME（测试/临时目录不能污染池）。
+    return Path.home() / ".grok" / "config.toml"
 
 
 def _candidate_entries() -> list[dict[str, str]]:

@@ -34,6 +34,13 @@
             ${tokensCell(e)}
             ${feeCell(e)}
             <td>${fmtRealCost(e.real_cost_cny)}</td>`;
+          const errLink = tr.querySelector('[data-error-id]');
+          if (errLink) {
+            errLink.onclick = (ev) => {
+              ev.preventDefault();
+              jumpToError(errLink.dataset.errorId);
+            };
+          }
           const feeTd = tr.querySelector('[data-fee]');
           if (feeTd) feeTd.onclick = () => openFeeModal(e);
           tb.appendChild(tr);
@@ -360,7 +367,7 @@
           tr.innerHTML = `
             <td class="mono">${fmtTs(e.ts)}</td>
             <td class="mono">${escapeHtml(e.pool || "")}</td>
-            <td class="mono">${escapeHtml(e.client_model || "")}</td>
+            <td class="mono col-model">${escapeHtml(e.client_model || "")}</td>
             <td>${statusPill(e.status)}</td>
             <td class="mono muted" title="${escapeHtml(attemptsSummary(e))}">${attemptsSummary(e).slice(0, 80)}</td>
             <td class="mono muted" title="${escapeHtml(e.error || "")}">${escapeHtml((e.error || "").slice(0, 90))}</td>
@@ -880,8 +887,11 @@
       const v = ($("claudeModel").value || "local-direct").trim();
       const isDeepseek = v !== "local-direct" && v !== DEFAULT_MODEL;
       const mode = v === "local-direct" ? "local-direct" : isDeepseek ? "deepseek" : "openai-all";
+      if (mode === "local-direct" && !confirm("将恢复 Claude Code 本机原配置，当前受管配置会被覆盖。继续？")) return;
       const payload = { mode };
       if (mode === "deepseek") payload.model = v;
+      const btn = $("btnApplyClaude");
+      btn.disabled = true;
       try {
         showMsg("正在应用 Claude Code 配置 " + v + " …", true);
         const r = await api("/api/claude/config", { method: "PUT", body: JSON.stringify(payload) });
@@ -895,13 +905,17 @@
         renderClaudeStatus();
         await refreshModels();
       } catch (e) { showMsg(e.message, false); }
+      finally { btn.disabled = false; }
     };
 
     $("btnApplyGrok").onclick = async () => {
       const v = ($("grokModel").value || "local-direct").trim();
       const mode = v === "local-direct" ? "local-direct" : "grok";
+      if (mode === "local-direct" && !confirm("将恢复 Grok CLI 本机原配置，当前受管配置会被覆盖。继续？")) return;
       const payload = { mode };
       if (mode === "grok") payload.model = v;
+      const btn = $("btnApplyGrok");
+      btn.disabled = true;
       try {
         showMsg("正在应用 Grok 配置 " + v + " …", true);
         const r = await api("/api/grok/config", { method: "PUT", body: JSON.stringify(payload) });
@@ -913,6 +927,7 @@
         renderGrokStatus();
         await refreshModels();
       } catch (e) { showMsg(e.message, false); }
+      finally { btn.disabled = false; }
     };
 
     $("bridgeToggle").onchange = async () => {
@@ -933,6 +948,9 @@
 
     $("btnApplyActive").onclick = async () => {
       const m = ($("activeModel").value || DEFAULT_MODEL).trim();
+      if (m === "local-direct" && !confirm("将恢复 Codex 本机原配置，当前受管配置会被覆盖。继续？")) return;
+      const btn = $("btnApplyActive");
+      btn.disabled = true;
       try {
         showMsg("正在应用 " + m + " 并同步 Codex 配置…", true);
         const r = await api("/api/active-model", {
@@ -960,6 +978,7 @@
         await refreshModels();
         await Promise.all([loadUpstreams(), loadOverview()]);
       } catch (e) { showMsg(e.message, false); }
+      finally { btn.disabled = false; }
     };
 
     $("btnSave").onclick = async () => {

@@ -146,13 +146,16 @@ def _extract_session_id(headers: dict[str, str], body: dict) -> Optional[str]:
 
     优先级：
     1. 头部 x-claude-code-session-id / claude-code-session-id（Claude Code）；
-    2. 头部 session_id / x-session-id（Codex/Responses 类客户端）；
-    3. body.metadata.user_id（兼容 user_xxx_session_yyy 与 JSON 字符串）；
-    4. body.metadata.session_id。
+    2. 头部 x-grok-session-id（Grok CLI）；
+    3. 头部 session_id / x-session-id（Codex/Responses 类客户端）；
+    4. body.metadata.user_id（兼容 user_xxx_session_yyy 与 JSON 字符串）；
+    5. body.metadata.session_id；
+    6. body.prompt_cache_key（Grok CLI 用会话 UUID 做缓存键）。
     """
     for key in (
         "x-claude-code-session-id",
         "claude-code-session-id",
+        "x-grok-session-id",
         "session-id",
         "x-session-id",
         "session_id",
@@ -161,26 +164,50 @@ def _extract_session_id(headers: dict[str, str], body: dict) -> Optional[str]:
         if value:
             return value
 
-    metadata = body.get("metadata")
-    if not isinstance(metadata, dict):
+    if not isinstance(body, dict):
         return None
-    user_id = metadata.get("user_id")
-    if isinstance(user_id, str) and user_id:
-        # cc-switch 老格式：user_xxx_session_yyy
-        if "_session_" in user_id:
-            return user_id.split("_session_", 1)[1]
-        # Claude Code 2.1.x 实测：user_id 是含 session_id 的 JSON 字符串
-        try:
-            parsed = json.loads(user_id)
-            if isinstance(parsed, dict):
-                sid = parsed.get("session_id")
-                if isinstance(sid, str) and sid:
-                    return sid
-        except Exception:
-            pass
-    sid = metadata.get("session_id")
-    if isinstance(sid, str) and sid:
-        return sid
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict):
+        user_id = metadata.get("user_id")
+        if isinstance(user_id, str) and user_id:
+            # cc-switch 老格式：user_xxx_session_yyy
+            if "_session_" in user_id:
+                return user_id.split("_session_", 1)[1]
+            # Claude Code 2.1.x 实测：user_id 是含 session_id 的 JSON 字符串
+            try:
+                parsed = json.loads(user_id)
+                if isinstance(parsed, dict):
+                    sid = parsed.get("session_id")
+                    if isinstance(sid, str) and sid:
+                        return sid
+            except Exception:
+                pass
+        sid = metadata.get("session_id")
+        if isinstance(sid, str) and sid:
+            return sid
+    for key in ("prompt_cache_key", "session_id"):
+        sid = body.get(key)
+        if isinstance(sid, str) and sid.strip():
+            return sid.strip()
+    return None
+
+
+def _extract_reasoning_effort(body: dict) -> Optional[str]:
+    """Responses / Chat 请求里的思考强度。"""
+    if not isinstance(body, dict):
+        return None
+    re_obj = body.get("reasoning")
+    if isinstance(re_obj, dict):
+        for key in ("effort", "reasoning_effort"):
+            value = re_obj.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    elif isinstance(re_obj, str) and re_obj.strip():
+        return re_obj.strip()
+    for key in ("reasoning_effort", "effort"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return None
 
 

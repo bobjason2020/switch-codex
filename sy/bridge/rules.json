@@ -29,13 +29,13 @@
     {
       "name": "File Listing Commands",
       "tools": ["Bash"],
-      "pattern": "^(ls|dir|cat|head|tail|find|which|where|echo|printf|pwd|whoami|date|env|printenv|wc|sort|uniq|file|stat|du|tree|realpath|basename|dirname)\\b",
+      "pattern": "^(ls|dir|cat|head|tail|find|which|where|echo|printf|pwd|whoami|date|wc|sort|uniq|file|stat|du|tree|realpath|basename|dirname)\\b",
       "reason": "File listing and info commands are safe"
     },
     {
       "name": "Build and Test Commands",
       "tools": ["Bash"],
-      "pattern": "^(npm|yarn|pnpm|npx|node|python|python3|pip|pip3|cargo|go|make|cmake|gradle|mvn|dotnet|java|javac|rustc|gcc|g\\+\\+|clang)\\b",
+      "pattern": "^(npm|yarn|pnpm|npx|cargo|go|make|cmake|gradle|mvn|dotnet|javac|rustc|gcc|g\\+\\+|clang)\\b",
       "reason": "Build toolchain commands are safe"
     },
     {
@@ -47,7 +47,7 @@
     {
       "name": "Package Install Commands",
       "tools": ["Bash"],
-      "pattern": "^(npm|yarn|pnpm|pip|pip3|cargo|go)\\s+install\\b",
+      "pattern": "^(npm|yarn|pnpm|cargo|go)\\s+install\\b",
       "reason": "Package installation commands are safe"
     },
     {

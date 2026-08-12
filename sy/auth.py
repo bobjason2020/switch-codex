@@ -208,6 +208,8 @@ def _ensure_master_key() -> str:
 def _keys_equal(left: str, right: str) -> bool:
     if not isinstance(left, str) or not isinstance(right, str):
         return False
+    if not left or not right:
+        return False
     if len(left) != len(right):
         secrets.compare_digest(right, right)
         return False

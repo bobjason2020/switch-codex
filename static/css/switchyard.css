@@ -153,6 +153,10 @@ body::before {
 .sidebar-foot {
   border-top: 1px solid var(--border-soft);
   padding: 12px 8px 2px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 .health {
   display: flex;
@@ -219,6 +223,7 @@ body::before {
 }
 
 .content { max-width: 1200px; width: 100%; margin: 0 auto; padding: 20px 24px 64px; }
+.content.wide { max-width: 1760px; }
 
 .sub-nav {
   display: flex;
@@ -428,6 +433,8 @@ td[colspan] { text-align: center; color: var(--muted); padding: 34px 8px; }
 .box.sid-9 { background: rgba(169, 227, 75, 0.16); color: #c0eb75; border: 1px solid rgba(169, 227, 75, 0.28); }
 /* 分类器标签：灰色低透明度，置于 effort 旁 */
 .box.box-cls { margin-left: 6px; padding: 0 5px; border-radius: 4px; font-size: 0.7rem; white-space: nowrap; background: rgba(148, 148, 148, 0.14); color: #bdbdbd; border: 1px solid rgba(148, 148, 148, 0.25); }
+.log-table { min-width: 1120px; }
+.col-model { white-space: nowrap; word-break: normal; overflow-wrap: normal; }
 
 .tps-box {
   display: inline-block;

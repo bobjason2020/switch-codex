@@ -87,7 +87,7 @@
             statusTip = "手动探测 · 倍率 ×" + fmtMultShort(it.multiplier) +
               (it.upstream ? " · 上游 " + it.upstream : "");
           } else if (it.ok === false) {
-            multText = it.error || "全部失败";
+            multText = escapeHtml(it.error || "全部失败");
             statusTip = "手动探测 · " + (it.error || "全部失败");
           } else {
             multText = "探测已关闭";
@@ -99,7 +99,7 @@
           statusTip = "倍率 ×" + fmtMultShort(it.multiplier) +
             (it.upstream ? " · 上游 " + it.upstream : "");
         } else if (it.ok === false) {
-          multText = it.error || "全部失败";
+          multText = escapeHtml(it.error || "全部失败");
           statusTip = it.error || "全部失败";
         } else {
           multText = "探测中…";

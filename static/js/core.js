@@ -34,8 +34,13 @@
     }
 
     function setKey(token) {
-      if (token) localStorage.setItem("sy_master_key", token);
-      else localStorage.removeItem("sy_master_key");
+      if (token) {
+        localStorage.setItem("sy_master_key", token);
+        localStorage.removeItem("sr_master_key");
+      } else {
+        localStorage.removeItem("sy_master_key");
+        localStorage.removeItem("sr_master_key");
+      }
     }
 
     async function api(path, opts = {}) {
@@ -198,8 +203,8 @@
       const cls = e.is_classifier ? '<span class="box box-cls">分类器</span>' : "";
       const line2 = [effort, cls].filter(Boolean).join(" ");
       if (!model && !line2) return "<td></td>";
-      if (!line2) return `<td class="mono">${model}</td>`;
-      return `<td class="mono">
+      if (!line2) return `<td class="mono col-model">${model}</td>`;
+      return `<td class="mono col-model">
         <div>${model}</div>
         <div class="muted">${line2}</div>
       </td>`;

@@ -17,7 +17,6 @@ from sy.const import (
     CAPACITY_HINTS,
     ERROR_LOG_ATTEMPT_BODY_MAX,
     FAILOVER_STATUS,
-    LOG_STREAM_BUF_MAX,
 )
 
 log = logging.getLogger("switchyard.proxy")
@@ -344,13 +343,7 @@ async def proxy_responses(
             if isinstance(j, dict):
                 client_model = j.get("model")
                 stream = bool(j.get("stream", False))
-                re_obj = j.get("reasoning")
-                if isinstance(re_obj, dict):
-                    reasoning_effort = re_obj.get("effort")
-                elif isinstance(re_obj, str):
-                    reasoning_effort = re_obj
-                if reasoning_effort is None:
-                    reasoning_effort = j.get("reasoning_effort")
+                reasoning_effort = logbook._extract_reasoning_effort(j)
         except Exception:
             pass
     session_id = logbook._extract_session_id(
@@ -858,7 +851,7 @@ async def proxy_responses(
                     },
                 )
 
-            # On failover of the preferred availability winner, re-run cascade once.
+            # 首选上游失败：后台重级联，请求本身立刻改走剩余候选，不阻塞 30s 探测。
             if (
                 not cascaded_once
                 and client_model
@@ -866,41 +859,18 @@ async def proxy_responses(
                 and upstream.get("name") == prefer_name
             ):
                 cascaded_once = True
-                probe_timeout = min(timeout, 30.0)
                 log.info(
                     "re-cascade after failover model=%s failed=%s exclude=%s",
                     client_model,
                     upstream.get("name"),
                     list(failed_ids),
                 )
-                try:
-                    avail = await probes._cascade_probe_model(
-                        str(client_model),
-                        timeout=probe_timeout,
-                        record_log=True,
-                        exclude_ids=set(failed_ids),
-                    )
-                except Exception:
-                    log.exception("re-cascade failed model=%s", client_model)
-                    avail = None
-                if avail and avail.get("ok"):
-                    candidates = core.order_candidates_for_model(
-                        client_model, route_pool, exclude_ids=set(failed_ids)
-                    )
-                    prefer_name = candidates[0].get("name") if candidates else None
-                    idx = 0
-                    log.info(
-                        "re-cascade winner=%s remaining=%s",
-                        prefer_name,
-                        [u.get("name") for u in candidates],
-                    )
-                else:
-                    # No new winner; continue residual low→high list excluding failed.
-                    candidates = core.order_candidates_for_model(
-                        client_model, route_pool, exclude_ids=set(failed_ids)
-                    )
-                    prefer_name = None
-                    idx = 0
+                await _kick_recascade(client_model, failed_ids, timeout)
+                candidates = core.order_candidates_for_model(
+                    client_model, route_pool, exclude_ids=set(failed_ids)
+                )
+                prefer_name = candidates[0].get("name") if candidates else None
+                idx = 0
         await client.aclose()
     except Exception as e:
         await client.aclose()
@@ -1005,6 +975,7 @@ async def proxy_anthropic_messages(
         usage: Optional[dict] = None,
         duration_ms: Optional[float] = None,
         ttft_ms: Optional[float] = None,
+        upstream_id: Optional[str] = None,
     ) -> None:
         logbook._record_log(
             client_ip=client_ip,
@@ -1016,6 +987,7 @@ async def proxy_anthropic_messages(
             reasoning_effort=reasoning_effort,
             is_classifier=is_classifier,
             upstream=upstream,
+            upstream_id=upstream_id,
             upstream_url=url,
             multiplier=multiplier,
             status=status,
@@ -1236,7 +1208,8 @@ async def proxy_anthropic_messages(
                             uurl=upstream_url,
                             arrived=arrived_ms,
                         ):
-                            buf = bytearray()
+                            sink = _UsageSink()
+                            sse_buf = _SseLineBuffer()
                             stream_error = None
                             client_disconnect = False
                             first_ms = None
@@ -1245,45 +1218,58 @@ async def proxy_anthropic_messages(
                                     if first_ms is None:
                                         first_ms = (time.perf_counter() - t0) * 1000.0
                                     if chunk:
-                                        if len(buf) < LOG_STREAM_BUF_MAX:
-                                            buf.extend(chunk)
+                                        for line in sse_buf.feed(chunk):
+                                            sink.feed_line(line)
                                         yield chunk
                             except asyncio.CancelledError:
                                 client_disconnect = True
                                 raise
                             except Exception as e:
                                 stream_error = f"stream aborted: {e}"
-                                raise
+                                try:
+                                    yield _sse_error_bytes(str(e))
+                                except Exception:
+                                    pass
                             finally:
-                                await r.aclose()
-                                await c.aclose()
+                                leftover = sse_buf.flush()
+                                if leftover:
+                                    sink.feed_line(leftover)
+                                await _aclose_quietly(r, c)
                                 stream_err_log_id = None
+                                ok = stream_error is None
                                 if stream_error and not client_disconnect:
                                     stream_err_log_id = record_error(
                                         status=r.status_code,
                                         error=stream_error,
                                         attempts=list(errors),
                                     )
-                                status = r.status_code
+                                if ok and not client_disconnect and client_model:
+                                    probes._set_model_availability(
+                                        str(client_model),
+                                        _live_ok_payload(
+                                            str(client_model), route_pool, up, r.status_code
+                                        ),
+                                    )
                                 record(
-                                    status=status,
+                                    status=r.status_code,
                                     upstream=up.get("name"),
                                     url=uurl,
                                     multiplier=core.upstream_multiplier_value(up),
                                     error_log_id=stream_err_log_id,
                                     attempts=list(errors) if errors else None,
-                                    usage=logbook._extract_usage(bytes(buf)),
+                                    usage=sink.usage,
                                     duration_ms=(time.perf_counter() - t0) * 1000.0,
                                     ttft_ms=first_ms if first_ms is not None else arrived,
+                                    upstream_id=up.get("id"),
                                 )
 
-                        out_headers = {
+                        out_headers = _stream_headers({
                             "content-type": out_ct or "text/event-stream",
                             "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
                             "x-switch-codex-pool": _header_safe(umodel),
                             "x-switch-codex-route-pool": _header_safe(route_pool),
                             "x-switch-codex-active-model": _header_safe(active),
-                        }
+                        })
                         if client_model is not None:
                             out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
                         return StreamingResponse(
@@ -1295,6 +1281,13 @@ async def proxy_anthropic_messages(
                     raw = await resp.aread()
                     await resp.aclose()
                     usage = logbook._extract_usage(raw)
+                    if client_model:
+                        probes._set_model_availability(
+                            str(client_model),
+                            _live_ok_payload(
+                                str(client_model), route_pool, upstream, 200
+                            ),
+                        )
                     record(
                         status=200,
                         upstream=upstream.get("name"),
@@ -1304,6 +1297,7 @@ async def proxy_anthropic_messages(
                         usage=usage,
                         duration_ms=(time.perf_counter() - t0) * 1000.0,
                         ttft_ms=arrived_ms,
+                        upstream_id=upstream.get("id"),
                     )
                     out_headers = {
                         "content-type": resp.headers.get("content-type", "application/json"),
@@ -1360,11 +1354,11 @@ async def proxy_anthropic_messages(
                         chatc=chat_conv,
                         arrived=arrived_ms,
                     ):
-                        buf = bytearray()
+                        sink = _UsageSink()
+                        sse_buf = _SseLineBuffer()
                         stream_error = None
                         client_disconnect = False
                         first_ms = None
-                        pending_line = ""
                         chat_finalized = False
                         try:
                             async for chunk in r.aiter_bytes():
@@ -1372,68 +1366,59 @@ async def proxy_anthropic_messages(
                                     first_ms = (time.perf_counter() - t0) * 1000.0
                                 if not chunk:
                                     continue
-                                if len(buf) < LOG_STREAM_BUF_MAX:
-                                    buf.extend(chunk)
-                                # 跨 chunk 缓冲：SSE data 行可能被任意截断，暂存最后不完整行。
-                                pending_line += chunk.decode("utf-8", errors="replace")
-                                lines = pending_line.split("\n")
-                                pending_line = lines.pop()
-                                for line in lines:
-                                    line = line.strip()
-                                    if line.startswith("data:"):
-                                        data = line[5:].strip()
-                                        if data == "[DONE]":
-                                            if chatc is not None and not chat_finalized:
-                                                chat_finalized = True
-                                                events = feed_responses_sse(chatc.finalize())
-                                            else:
-                                                events = conv.finalize()
-                                        elif data.startswith("{"):
-                                            try:
-                                                obj = json.loads(data)
-                                            except Exception:
-                                                continue
-                                            if chatc is not None:
-                                                events = feed_responses_sse(
-                                                    chatc.handle_chunk(obj)
-                                                )
-                                            else:
-                                                events = conv.handle_chunk(obj)
-                                        else:
-                                            continue
-                                        for ev in events:
-                                            yield ev.encode("utf-8")
-                            # 流结束：处理缓冲中遗留的最后一行
-                            if pending_line.strip():
-                                line = pending_line.strip()
-                                if not line.startswith("data:"):
-                                    # 非数据行（id:/event:/注释行）：与主循环一致直接跳过，
-                                    # 不引用 data/events（此前会 NameError 误判整个流 abort）。
-                                    pass
-                                else:
-                                    data = line[5:].strip()
+                                for line in sse_buf.feed(chunk):
+                                    stripped = line.strip()
+                                    if not stripped.startswith("data:"):
+                                        continue
+                                    data = stripped[5:].strip()
                                     if data == "[DONE]":
                                         if chatc is not None and not chat_finalized:
                                             chat_finalized = True
                                             events = feed_responses_sse(chatc.finalize())
                                         else:
                                             events = conv.finalize()
-                                        for ev in events:
-                                            yield ev.encode("utf-8")
                                     elif data.startswith("{"):
                                         try:
                                             obj = json.loads(data)
                                         except Exception:
-                                            pass
+                                            continue
+                                        sink.feed_obj(obj)
+                                        if chatc is not None:
+                                            events = feed_responses_sse(
+                                                chatc.handle_chunk(obj)
+                                            )
                                         else:
-                                            if chatc is not None:
-                                                events = feed_responses_sse(
-                                                    chatc.handle_chunk(obj)
-                                                )
-                                            else:
-                                                events = conv.handle_chunk(obj)
-                                            for ev in events:
-                                                yield ev.encode("utf-8")
+                                            events = conv.handle_chunk(obj)
+                                    else:
+                                        continue
+                                    for ev in events:
+                                        yield ev.encode("utf-8")
+                            leftover = sse_buf.flush()
+                            if leftover and leftover.strip().startswith("data:"):
+                                data = leftover.strip()[5:].strip()
+                                if data == "[DONE]":
+                                    if chatc is not None and not chat_finalized:
+                                        chat_finalized = True
+                                        events = feed_responses_sse(chatc.finalize())
+                                    else:
+                                        events = conv.finalize()
+                                    for ev in events:
+                                        yield ev.encode("utf-8")
+                                elif data.startswith("{"):
+                                    try:
+                                        obj = json.loads(data)
+                                    except Exception:
+                                        obj = None
+                                    if obj is not None:
+                                        sink.feed_obj(obj)
+                                        if chatc is not None:
+                                            events = feed_responses_sse(
+                                                chatc.handle_chunk(obj)
+                                            )
+                                        else:
+                                            events = conv.handle_chunk(obj)
+                                        for ev in events:
+                                            yield ev.encode("utf-8")
                             if chatc is not None and not chat_finalized:
                                 chat_finalized = True
                                 for ev in feed_responses_sse(chatc.finalize()):
@@ -1451,38 +1436,43 @@ async def proxy_anthropic_messages(
                             except Exception:
                                 pass
                         finally:
-                            await r.aclose()
-                            await c.aclose()
+                            await _aclose_quietly(r, c)
                             stream_err_log_id = None
-                            if not client_disconnect:
-                                if stream_error or not conv.is_completed():
-                                    reason = stream_error or "stream ended without message_stop"
-                                    stream_err_log_id = record_error(
-                                        status=r.status_code,
-                                        error=reason,
-                                        attempts=list(errors),
-                                    )
-                            status = r.status_code
-                            usage = conv.latest_usage or logbook._extract_usage(bytes(buf))
+                            ok = not stream_error and conv.is_completed()
+                            if not client_disconnect and not ok:
+                                reason = stream_error or "stream ended without message_stop"
+                                stream_err_log_id = record_error(
+                                    status=r.status_code,
+                                    error=reason,
+                                    attempts=list(errors),
+                                )
+                            if ok and not client_disconnect and client_model:
+                                probes._set_model_availability(
+                                    str(client_model),
+                                    _live_ok_payload(
+                                        str(client_model), route_pool, up, r.status_code
+                                    ),
+                                )
                             record(
-                                status=status,
+                                status=r.status_code,
                                 upstream=up.get("name"),
                                 url=uurl,
                                 multiplier=core.upstream_multiplier_value(up),
                                 error_log_id=stream_err_log_id,
                                 attempts=list(errors) if errors else None,
-                                usage=usage,
+                                usage=conv.latest_usage or sink.usage,
                                 duration_ms=(time.perf_counter() - t0) * 1000.0,
                                 ttft_ms=first_ms if first_ms is not None else arrived,
+                                upstream_id=up.get("id"),
                             )
 
-                    out_headers = {
+                    out_headers = _stream_headers({
                         "content-type": "text/event-stream",
                         "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
                         "x-switch-codex-pool": _header_safe(umodel),
                         "x-switch-codex-route-pool": _header_safe(route_pool),
                         "x-switch-codex-active-model": _header_safe(active),
-                    }
+                    })
                     if client_model is not None:
                         out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
                     return StreamingResponse(
@@ -1498,18 +1488,25 @@ async def proxy_anthropic_messages(
                 try:
                     parsed = json.loads(raw)
                 except Exception:
-                    out_headers = {
-                        "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
-                        "x-switch-codex-pool": _header_safe(umodel),
-                        "x-switch-codex-route-pool": _header_safe(route_pool),
-                        "x-switch-codex-active-model": _header_safe(active),
-                    }
+                    eid = record_error(
+                        status=502,
+                        error="upstream returned non-JSON",
+                        attempts=list(errors),
+                    )
+                    record(
+                        status=502,
+                        error_log_id=eid,
+                        attempts=list(errors) if errors else None,
+                        upstream=upstream.get("name"),
+                        url=upstream_url,
+                        upstream_id=upstream.get("id"),
+                    )
                     await client.aclose()
-                    return Response(
-                        content=raw,
+                    return JSONResponse(
                         status_code=502,
-                        media_type="application/json",
-                        headers=out_headers,
+                        content=anthropic.anthropic_error_response(
+                            502, "upstream returned non-JSON"
+                        ),
                     )
                 if chat_mode:
                     try:
@@ -1536,6 +1533,13 @@ async def proxy_anthropic_messages(
                 usage = logbook._extract_usage(
                     json.dumps(resp_obj, ensure_ascii=False).encode("utf-8")
                 )
+                if client_model:
+                    probes._set_model_availability(
+                        str(client_model),
+                        _live_ok_payload(
+                            str(client_model), route_pool, upstream, 200
+                        ),
+                    )
                 if stream:
                     # 客户端要流、上游却回 JSON：合成完整 Anthropic SSE 再下发
                     # （借鉴 cc-switch streaming_responses.responses_json_to_anthropic_sse）。
@@ -1548,6 +1552,7 @@ async def proxy_anthropic_messages(
                         usage=usage,
                         duration_ms=(time.perf_counter() - t0) * 1000.0,
                         ttft_ms=arrived_ms,
+                        upstream_id=upstream.get("id"),
                     )
                     sse_events = anthropic.responses_json_to_anthropic_sse(resp_obj, req_payload)
                     out_headers = {
@@ -1578,6 +1583,7 @@ async def proxy_anthropic_messages(
                     usage=usage,
                     duration_ms=(time.perf_counter() - t0) * 1000.0,
                     ttft_ms=arrived_ms,
+                    upstream_id=upstream.get("id"),
                 )
                 out_headers = {
                     "content-type": "application/json",
@@ -1651,6 +1657,7 @@ async def proxy_anthropic_messages(
                     multiplier=core.upstream_multiplier_value(upstream),
                     error_log_id=eid,
                     attempts=list(errors) if errors else None,
+                    upstream_id=upstream.get("id"),
                 )
                 await client.aclose()
                 if not passthrough_mode:
@@ -1674,7 +1681,7 @@ async def proxy_anthropic_messages(
                     },
                 )
 
-            # On failover of the preferred availability winner, re-run cascade once.
+            # 首选上游失败：后台重级联，请求本身立刻改走剩余候选，不阻塞 30s 探测。
             if (
                 not cascaded_once
                 and client_model
@@ -1682,41 +1689,18 @@ async def proxy_anthropic_messages(
                 and upstream.get("name") == prefer_name
             ):
                 cascaded_once = True
-                probe_timeout = min(timeout, 30.0)
                 log.info(
                     "re-cascade after failover model=%s failed=%s exclude=%s",
                     client_model,
                     upstream.get("name"),
                     list(failed_ids),
                 )
-                try:
-                    avail = await probes._cascade_probe_model(
-                        str(client_model),
-                        timeout=probe_timeout,
-                        record_log=True,
-                        exclude_ids=set(failed_ids),
-                    )
-                except Exception:
-                    log.exception("re-cascade failed model=%s", client_model)
-                    avail = None
-                if avail and avail.get("ok"):
-                    candidates = core.order_candidates_for_model(
-                        client_model, route_pool, exclude_ids=set(failed_ids)
-                    )
-                    prefer_name = candidates[0].get("name") if candidates else None
-                    idx = 0
-                    log.info(
-                        "re-cascade winner=%s remaining=%s",
-                        prefer_name,
-                        [u.get("name") for u in candidates],
-                    )
-                else:
-                    # No new winner; continue residual low→high list excluding failed.
-                    candidates = core.order_candidates_for_model(
-                        client_model, route_pool, exclude_ids=set(failed_ids)
-                    )
-                    prefer_name = None
-                    idx = 0
+                await _kick_recascade(client_model, failed_ids, timeout)
+                candidates = core.order_candidates_for_model(
+                    client_model, route_pool, exclude_ids=set(failed_ids)
+                )
+                prefer_name = candidates[0].get("name") if candidates else None
+                idx = 0
         await client.aclose()
     except Exception as e:
         await client.aclose()

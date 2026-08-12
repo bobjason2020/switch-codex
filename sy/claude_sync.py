@@ -444,10 +444,12 @@ def restore_local_original() -> dict:
     if orig.get("original_settings_existed") and (ORIGINAL_DIR / "settings.json").exists():
         _copy_file_if_exists(ORIGINAL_DIR / "settings.json", sp)
         actions.append("restored settings.json")
-    else:
+    elif orig.get("original_settings_existed") is False:
         if sp.exists():
             sp.unlink()
             actions.append("deleted settings.json (originally missing)")
+    else:
+        actions.append("settings.json untouched (snapshot incomplete)")
     # 快照恢复是整文件覆盖，settings.json 中的 hook 注册随之消失；
     # bridge 目录保留（rules.json 可能有用户修改）
     if had_hook:

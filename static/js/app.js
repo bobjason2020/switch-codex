@@ -195,27 +195,38 @@
     });
     $("btnSavePublic").onclick = savePublicSettings;
     $("btnSavePublicRules").onclick = savePublicSettings;
+    const btnLogout = $("btnLogout");
+    if (btnLogout) btnLogout.onclick = logout;
 
     setInterval(checkHealth, 15000);
     bootApp().catch((e) => showMsg(e.message, false));
 
+    function formDirty() {
+      const el = document.activeElement;
+      if (!el) return false;
+      const tag = (el.tagName || "").toLowerCase();
+      return tag === "input" || tag === "textarea" || tag === "select";
+    }
+
     setInterval(() => {
-      if (appBooted && getKey() && $("page-logs").style.display !== "none" && logOffset === 0) {
+      if (!appBooted || !getKey()) return;
+      if (formDirty()) return;
+      if ($("page-logs").style.display !== "none" && logOffset === 0) {
         loadLogs(false);
       }
-      if (appBooted && getKey() && $("page-errors").style.display !== "none" && errOffset === 0) {
+      if ($("page-errors").style.display !== "none" && errOffset === 0) {
         loadErrors(false);
       }
-      if (appBooted && getKey() && $("page-upstreams").style.display !== "none") {
+      if ($("page-upstreams").style.display !== "none") {
         loadUpstreams();
       }
-      if (appBooted && getKey() && $("page-overview").style.display !== "none") {
+      if ($("page-overview").style.display !== "none") {
         loadModelAvailability();
       }
-      if (appBooted && getKey() && $("page-history").style.display !== "none") {
+      if ($("page-history").style.display !== "none") {
         loadAvailabilityHistory();
       }
-      if (appBooted && getKey() && $("sub-public") && $("sub-public").style.display !== "none") {
+      if ($("sub-public") && $("sub-public").style.display !== "none") {
         loadPublicAccess();
       }
     }, 10000);
@@ -229,9 +240,6 @@ if (document.readyState === "loading") {
 } else {
   initRoute();
 }
-// 兜底：部分加载场景下 history 就位晚于脚本执行，稍后再解析一次。
-setTimeout(initRoute, 0);
-window.addEventListener("pageshow", initRoute, { once: true });
 
 function updateClock() {
   const el = $("clock");

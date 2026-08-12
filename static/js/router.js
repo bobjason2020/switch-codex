@@ -42,6 +42,8 @@ function switchPage(name) {
   const page = $("page-" + name);
   setPageTitle(name);
   if (page) page.style.display = "block";
+  const content = document.querySelector(".content");
+  if (content) content.classList.toggle("wide", name === "logs" || name === "errors");
   if (name === "overview") loadOverview();
   else if (name === "history") loadAvailabilityHistory();
   else if (name === "upstreams") loadUpstreams();

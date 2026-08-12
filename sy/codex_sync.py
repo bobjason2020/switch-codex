@@ -180,25 +180,23 @@ def _atomic_write(path: Path, text: str) -> None:
 
 
 def ensure_original_snapshot() -> dict:
-    """一次性快照项目介入前的 Codex 配置；老部署用首次 apply_deepseek 的旧备份迁移。"""
+    """一次性快照项目介入前的 Codex 配置。只从当前 ~/.codex 取，不用 BACKUP_CONFIG。"""
     if ORIGINAL_MANIFEST.exists():
         return _read_json(ORIGINAL_MANIFEST, {})
+
+    if str(codex_home().resolve()) != str((Path.home() / ".codex").resolve()):
+        raise RuntimeError(
+            f"拒绝在非默认配置目录拍原始快照: {codex_home()}（CODEX_HOME 指向了别处）"
+        )
 
     info: dict[str, Any] = {
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "codex_home": str(codex_home()),
     }
-    # 老部署：旧备份（首次 apply_deepseek 前的快照）就是最接近“介入前”的状态
-    if BACKUP_CONFIG.exists():
-        src_cfg = BACKUP_CONFIG
-        src_models = BACKUP_MODELS if BACKUP_MODELS.exists() else None
-        info["original_config_existed"] = True
-        info["original_models_existed"] = src_models is not None
-    else:
-        src_cfg = config_path() if config_path().exists() else None
-        src_models = models_path() if models_path().exists() else None
-        info["original_config_existed"] = src_cfg is not None
-        info["original_models_existed"] = src_models is not None
+    src_cfg = config_path() if config_path().exists() else None
+    src_models = models_path() if models_path().exists() else None
+    info["original_config_existed"] = src_cfg is not None
+    info["original_models_existed"] = src_models is not None
     auth = auth_path()
     info["original_auth_existed"] = auth.exists()
 
@@ -280,11 +278,10 @@ def _write_client_auth() -> bool:
     """写 ~/.codex/auth.json：客户端用 master key 访问 4100。"""
     auth = auth_path()
     auth.parent.mkdir(parents=True, exist_ok=True)
-    auth.write_text(
+    _atomic_write(
+        auth,
         json.dumps({"OPENAI_API_KEY": _router_master_key()}, indent=2) + "\n",
-        encoding="utf-8",
     )
-    auth.chmod(0o600)
     log.info("wrote client auth.json")
     return True
 
@@ -638,11 +635,8 @@ def apply_openai_all() -> dict[str, Any]:
         _copy_file_if_exists(ORIGINAL_DIR / "models.json", mods_p)
         actions.append("restored original models.json")
     else:
-        if mods_p.exists():
-            mods_p.unlink()
-            actions.append("deleted models.json (originally missing)")
-        else:
-            actions.append("models.json untouched (none)")
+        # openai-all 不删用户 models.json，只在没有快照可还原时保持现状。
+        actions.append("models.json untouched")
 
     _write_client_auth()
     _save_manifest(
@@ -661,32 +655,49 @@ def restore_local_original() -> dict[str, Any]:
     ensure_original_snapshot()
     _save_openai_snapshot_if_needed()
     orig = _read_json(ORIGINAL_MANIFEST, {})
+    if not isinstance(orig, dict) or not orig.get("codex_home"):
+        raise RuntimeError("原始配置快照缺失或损坏，拒绝恢复（请手动核对 ~/.codex）")
+    if os.path.realpath(str(orig["codex_home"])) != os.path.realpath(str(codex_home())):
+        raise RuntimeError(
+            f"快照目录 {orig['codex_home']!r} 与当前 codex_home {codex_home()!r} "
+            "不一致，拒绝恢复"
+        )
     actions: list[str] = []
     cfg_p, mods_p, auth = config_path(), models_path(), auth_path()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    for src, name in ((cfg_p, "config.toml"), (mods_p, "models.json"), (auth, "auth.json")):
+        if src.exists():
+            _copy_file_if_exists(src, BACKUP_DIR / f"restore-point-{stamp}-{name}")
 
     if orig.get("original_config_existed") and (ORIGINAL_DIR / "config.toml").exists():
         _copy_file_if_exists(ORIGINAL_DIR / "config.toml", cfg_p)
         actions.append("restored config.toml")
-    else:
+    elif orig.get("original_config_existed") is False:
         if cfg_p.exists():
             cfg_p.unlink()
             actions.append("deleted config.toml (originally missing)")
+    else:
+        actions.append("config.toml untouched (snapshot incomplete)")
 
     if orig.get("original_models_existed") and (ORIGINAL_DIR / "models.json").exists():
         _copy_file_if_exists(ORIGINAL_DIR / "models.json", mods_p)
         actions.append("restored models.json")
-    else:
+    elif orig.get("original_models_existed") is False:
         if mods_p.exists():
             mods_p.unlink()
             actions.append("deleted models.json (originally missing)")
+    else:
+        actions.append("models.json untouched (snapshot incomplete)")
 
     if orig.get("original_auth_existed") and (ORIGINAL_DIR / "auth.json").exists():
         _copy_file_if_exists(ORIGINAL_DIR / "auth.json", auth)
         actions.append("restored auth.json")
-    else:
+    elif orig.get("original_auth_existed") is False:
         if auth.exists():
             auth.unlink()
             actions.append("deleted auth.json (originally missing)")
+    else:
+        actions.append("auth.json untouched (snapshot incomplete)")
 
     _save_manifest(
         {

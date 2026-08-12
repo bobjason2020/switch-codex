@@ -317,10 +317,11 @@
       const btn = $("btnChangePwSave");
       btn.disabled = true;
       try {
-        await api("/api/change-password", {
+        const r = await api("/api/change-password", {
           method: "POST",
           body: JSON.stringify({ old_password: oldPw, new_password: newPw }),
         });
+        if (r && r.token) setKey(r.token);
         authMustChange = false;
         hideChangePw();
         showMsg("密码已修改", true);
@@ -330,6 +331,15 @@
       } finally {
         btn.disabled = false;
       }
+    }
+
+    async function logout() {
+      try {
+        await api("/api/logout", { method: "POST" });
+      } catch (e) { /* 会话已失效也清本地 */ }
+      setKey("");
+      appBooted = false;
+      showLogin();
     }
 
     async function bootApp() {

@@ -77,9 +77,10 @@ Anthropic 格式直接透传（零转换）；未开启的上游走 Anthropic �
 共用同一套模型池、倍率、failover 与日志）。UI 的「Grok 配置」支持两种模式：
 
 - **本机原配置**：恢复项目介入前的 `~/.grok/config.toml` 快照，Grok CLI 直连原 provider；
-- **grok 池**：在 `~/.grok/config.toml` 写入受管模型段 `[model."switchyard"]`（`base_url`
+- **grok 池**：在 `~/.grok/config.toml` 写入受管模型段 `[model."grok-4.6"]`（`base_url`
   指向本路由、`api_backend = "responses"`、`api_key` 为路由 master key、`name` 与
-  `model` 均为客户端模型 id、`context_window = 500000`、开启 backend search），并把
+  `model` 均为客户端模型 id、`context_window = 500000`、开启 backend search 与
+  `supports_reasoning_effort`，并列出 `low/medium/high/xhigh`），并把
   `[models].default` / `[models].web_search` 都切到该段。同时清掉浮生搜索模型段与
   `fusheng-search` MCP。受管段的 `model` 为 grok 池下的客户端模型（默认 `grok-4.6`），
   其它配置（用户自定义模型、其余 mcp_servers、ui、marketplace 等）原样保留。

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import threading
 import time
 import uuid
@@ -628,7 +629,10 @@ def _normalize_newapi_probe(raw: Any, index: int = 0) -> dict[str, Any]:
     except (TypeError, ValueError):
         interval = DEFAULT_NEWAPI_PROBE["interval_sec"]
     out["interval_sec"] = max(15, min(interval, 86400))
-    out["base_url"] = str(out.get("base_url") or "").strip().rstrip("/")
+    base_url = str(out.get("base_url") or "").strip().rstrip("/")
+    if base_url and not re.match(r"^[a-z][a-z0-9+.-]*://", base_url, re.IGNORECASE):
+        base_url = "https://" + base_url
+    out["base_url"] = base_url
     out["group"] = str(out.get("group") or "").strip()
     out["upstream_name"] = str(out.get("upstream_name") or "").strip()
     out["access_token"] = str(out.get("access_token") or "").strip()

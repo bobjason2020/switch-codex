@@ -66,6 +66,18 @@ def normalize_path(p: str) -> str:
     return os.path.abspath(p).replace("\\", "/")
 
 
+def _resolved(p: str) -> Path:
+    return Path(p).expanduser().resolve()
+
+
+def _is_relative_to(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
 def matches_regex(pattern: str, text: str) -> bool:
     """Check if regex pattern matches text."""
     try:
@@ -80,36 +92,41 @@ def check_path_condition(path_check: str, file_path: str,
     if not file_path:
         return False
 
-    norm_path = normalize_path(file_path)
-    norm_project = normalize_path(project_root)
-    home = normalize_path(os.path.expanduser("~"))
+    try:
+        path = _resolved(file_path)
+    except Exception:
+        return False
+    norm_path = str(path).replace("\\", "/")
+    home = Path.home().resolve()
 
     if path_check == "in_project":
-        norm_cwd = normalize_path(cwd)
-        return norm_path.startswith(norm_project) or norm_path.startswith(norm_cwd)
+        try:
+            return _is_relative_to(path, _resolved(project_root)) or _is_relative_to(
+                path, _resolved(cwd)
+            )
+        except Exception:
+            return False
 
     elif path_check == "in_memory_dir":
-        memory_base = normalize_path(os.path.join(home, ".claude", "projects"))
-        return memory_base in norm_path and "/memory/" in norm_path
+        memory_base = (home / ".claude" / "projects").resolve()
+        return _is_relative_to(path, memory_base) and "/memory/" in norm_path
 
     elif path_check == "is_system_path":
-        system_prefixes = [
-            "/etc/", "/usr/", "/System/", "/Windows/", "/Program Files/",
-            "/ProgramData/", "/boot/", "/sbin/", "/lib/", "/lib64/",
-            "C:/Windows/", "C:/Program Files/", "C:/Program Files (x86)/",
-            "C:/ProgramData/",
+        system_roots = [
+            Path("/etc"), Path("/usr"), Path("/System"), Path("/Windows"),
+            Path("/Program Files"), Path("/ProgramData"), Path("/boot"),
+            Path("/sbin"), Path("/lib"), Path("/lib64"),
+            Path("C:/Windows"), Path("C:/Program Files"),
+            Path("C:/Program Files (x86)"), Path("C:/ProgramData"),
         ]
-        sensitive_home = [
-            normalize_path(os.path.join(home, ".ssh")),
-            normalize_path(os.path.join(home, ".gnupg")),
-            normalize_path(os.path.join(home, ".aws")),
-            normalize_path(os.path.join(home, ".config")),
-        ]
-        for prefix in system_prefixes:
-            if norm_path.startswith(prefix.lower()) or norm_path.startswith(prefix):
-                return True
-        for sh in sensitive_home:
-            if norm_path.startswith(sh):
+        for root in system_roots:
+            try:
+                if _is_relative_to(path, root.resolve()):
+                    return True
+            except Exception:
+                continue
+        for name in (".ssh", ".gnupg", ".aws", ".config"):
+            if _is_relative_to(path, home / name):
                 return True
         return False
 
@@ -206,7 +223,7 @@ Rules:
 - DENY if running sudo, force-push, curl-pipe-to-shell, or destructive git operations
 - ALLOW for normal development tasks: reading files, running builds, editing project code, running tests, git operations
 - ALLOW for file reads/writes within the project directory
-- ALLOW for common package manager commands (npm install, pip install, cargo build)
+- ALLOW for common package manager commands (npm install, cargo build)
 
 Respond with ONLY a JSON object: {{"decision": "allow" or "deny", "reason": "brief explanation"}}"""
 

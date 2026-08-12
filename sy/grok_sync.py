@@ -48,16 +48,16 @@ MANIFEST = BACKUP_DIR / "manifest.json"
 LOCAL_DIRECT = "local-direct"
 GROK_KNOWN = set(GROK_CLIENT_MODELS)
 
-# 受管模型段的固定 key（显示名用客户端模型 id，指向 4100 的 Responses 端点、路由 master key）
-MANAGED_KEY = "switchyard"
+# 旧受管段名；思考强度菜单按模型 id 查找，所以现改写成 [model."<slug>"]。
+LEGACY_MANAGED_KEY = "switchyard"
 MANAGED_CONTEXT_WINDOW = 500000
-MANAGED_SECTION = f"model.{MANAGED_KEY}"
 MANAGED_BASE_URL = provider_base_url()
 
 # 切到 grok 池时一并清掉，避免从本机快照再把浮生搜索带回来
 DROPPED_SECTIONS = (
     "model.grok-4.5-fusheng",
     "mcp_servers.fusheng-search",
+    f"model.{LEGACY_MANAGED_KEY}",
 )
 
 
@@ -170,26 +170,72 @@ def current_grok_slug() -> Optional[str]:
     return None
 
 
-def _is_dropped_section(hdr: str) -> bool:
-    if hdr == MANAGED_SECTION or hdr.startswith(MANAGED_SECTION + "."):
-        return True
+def _managed_key(model_slug: str) -> str:
+    return str(model_slug or "").strip() or next(iter(GROK_KNOWN))
+
+
+def _is_dropped_section(hdr: str, model_slug: str = "") -> bool:
+    keys = {LEGACY_MANAGED_KEY}
+    slug = str(model_slug or "").strip()
+    if slug:
+        keys.add(slug)
+    for key in keys:
+        prefix = f"model.{key}"
+        if hdr == prefix or hdr.startswith(prefix + "."):
+            return True
     for prefix in DROPPED_SECTIONS:
         if hdr == prefix or hdr.startswith(prefix + "."):
             return True
     return False
 
 
+def _toml_str(value: str) -> str:
+    """转义 TOML 基本字符串，避免 key/url 中的引号或反斜杠截断配置。"""
+    escaped = (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+    return f'"{escaped}"'
+
+
+_MANAGED_REASONING_EFFORTS = (
+    ("low", "Low", False),
+    ("medium", "Medium", False),
+    ("high", "High", False),
+    ("xhigh", "Xhigh", True),
+)
+
+
 def _managed_block(model_slug: str) -> list[str]:
-    return [
-        f'[model."{MANAGED_KEY}"]',
-        f'model = "{model_slug}"',
-        f'name = "{model_slug}"',
-        f'base_url = "{MANAGED_BASE_URL}"',
-        f'api_key = "{_router_master_key()}"',
+    key = _managed_key(model_slug)
+    lines = [
+        f"[model.{_toml_str(key)}]",
+        f"model = {_toml_str(key)}",
+        f"name = {_toml_str(key)}",
+        f"base_url = {_toml_str(MANAGED_BASE_URL)}",
+        f"api_key = {_toml_str(_router_master_key())}",
         'api_backend = "responses"',
         "supports_backend_search = true",
+        "supports_reasoning_effort = true",
+        'reasoning_effort = "xhigh"',
         f"context_window = {MANAGED_CONTEXT_WINDOW}",
     ]
+    for value, label, default in _MANAGED_REASONING_EFFORTS:
+        lines.extend(
+            [
+                "",
+                f"[[model.{_toml_str(key)}.reasoning_efforts]]",
+                f"value = {_toml_str(value)}",
+                f"label = {_toml_str(label)}",
+            ]
+        )
+        if default:
+            lines.append("default = true")
+    return lines
 
 
 def transform_config_toml(text: str, model_slug: str) -> tuple[str, list[str]]:
@@ -202,6 +248,7 @@ def transform_config_toml(text: str, model_slug: str) -> tuple[str, list[str]]:
     if text.strip():
         _parse_config(text)
 
+    managed_key = _managed_key(model_slug)
     lines = text.splitlines()
     out: list[str] = []
     report: list[str] = []
@@ -224,12 +271,14 @@ def transform_config_toml(text: str, model_slug: str) -> tuple[str, list[str]]:
         if _is_section_header(line, depth, mlstate):
             hdr = _section_name(line)
             cur_section = hdr
-            skip_section = _is_dropped_section(hdr)
+            skip_section = _is_dropped_section(hdr, managed_key)
             if skip_section:
-                if hdr == MANAGED_SECTION or hdr.startswith(MANAGED_SECTION + "."):
-                    report.append(f"移除受管段 [{hdr}]")
-                else:
+                if hdr.startswith("model.grok-4.5-fusheng") or hdr.startswith(
+                    "mcp_servers.fusheng-search"
+                ):
                     report.append(f"移除浮生搜索段 [{hdr}]")
+                else:
+                    report.append(f"移除受管段 [{hdr}]")
                 advance(line)
                 i += 1
                 continue
@@ -250,9 +299,9 @@ def transform_config_toml(text: str, model_slug: str) -> tuple[str, list[str]]:
             k = _key_of(line)
             if k in ("default", "web_search") and "=" in line:
                 indent = line[: len(line) - len(line.lstrip())]
-                new_line = f'{indent}{k} = "{MANAGED_KEY}"'
+                new_line = f"{indent}{k} = {_toml_str(managed_key)}"
                 if new_line != line:
-                    report.append(f"改写 [models] {k} → {MANAGED_KEY}")
+                    report.append(f"改写 [models] {k} → {managed_key}")
                 out.append(new_line)
                 if k == "default":
                     default_seen = True
@@ -268,9 +317,9 @@ def transform_config_toml(text: str, model_slug: str) -> tuple[str, list[str]]:
 
     missing_models_keys: list[tuple[str, str]] = []
     if not default_seen:
-        missing_models_keys.append(("default", f"补全 [models] default = {MANAGED_KEY}"))
+        missing_models_keys.append(("default", f"补全 [models] default = {managed_key}"))
     if not web_search_seen:
-        missing_models_keys.append(("web_search", f"补全 [models] web_search = {MANAGED_KEY}"))
+        missing_models_keys.append(("web_search", f"补全 [models] web_search = {managed_key}"))
     if missing_models_keys:
         if models_seen:
             insert_at = None
@@ -280,17 +329,17 @@ def transform_config_toml(text: str, model_slug: str) -> tuple[str, list[str]]:
                     break
             if insert_at is not None:
                 for offset, (key, note) in enumerate(missing_models_keys):
-                    out.insert(insert_at + offset, f'{key} = "{MANAGED_KEY}"')
+                    out.insert(insert_at + offset, f"{key} = {_toml_str(managed_key)}")
                     report.append(note)
             else:
                 out.extend(["", "[models]"])
                 for key, note in missing_models_keys:
-                    out.append(f'{key} = "{MANAGED_KEY}"')
+                    out.append(f"{key} = {_toml_str(managed_key)}")
                     report.append(note.replace("补全", "新增", 1))
         else:
             out.extend(["", "[models]"])
             for key, note in missing_models_keys:
-                out.append(f'{key} = "{MANAGED_KEY}"')
+                out.append(f"{key} = {_toml_str(managed_key)}")
                 report.append(note.replace("补全", "新增", 1))
 
     # 移除受管段可能遗留尾部空行：先清空再追加，保证重复应用幂等
@@ -368,10 +417,12 @@ def restore_local_original() -> dict:
     if orig.get("original_config_existed") and (ORIGINAL_DIR / "config.toml").exists():
         _copy_file_if_exists(ORIGINAL_DIR / "config.toml", sp)
         actions.append("restored config.toml")
-    else:
+    elif orig.get("original_config_existed") is False:
         if sp.exists():
             sp.unlink()
             actions.append("deleted config.toml (originally missing)")
+    else:
+        actions.append("config.toml untouched (snapshot incomplete)")
 
     man = _load_manifest()
     man.update(
@@ -414,7 +465,23 @@ def status() -> dict:
             models_section = obj.get("models")
             if isinstance(models_section, dict):
                 default_model = models_section.get("default")
-            managed = obj.get("model", {}).get(MANAGED_KEY)
+            model_map = obj.get("model")
+            managed = None
+            if isinstance(model_map, dict):
+                slug = man.get("model_slug") or default_model
+                for key in (slug, LEGACY_MANAGED_KEY):
+                    if key and isinstance(model_map.get(key), dict):
+                        managed = model_map[key]
+                        break
+                if managed is None:
+                    for cand in model_map.values():
+                        if not isinstance(cand, dict):
+                            continue
+                        if str(cand.get("base_url") or "").rstrip("/") == MANAGED_BASE_URL.rstrip(
+                            "/"
+                        ):
+                            managed = cand
+                            break
             if isinstance(managed, dict):
                 managed_present = True
                 config_model = managed.get("model")
