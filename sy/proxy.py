@@ -17,6 +17,8 @@ from sy.const import (
     CAPACITY_HINTS,
     ERROR_LOG_ATTEMPT_BODY_MAX,
     FAILOVER_STATUS,
+    PREFERRED_RETRY_BASE_DELAY_SEC,
+    PREFERRED_RETRY_COUNT,
 )
 
 log = logging.getLogger("switchyard.proxy")
@@ -29,6 +31,24 @@ def _is_capacity_error(text: Optional[str]) -> bool:
     """Detect upstream "model at capacity" style errors regardless of HTTP status."""
     lower = (text or "").lower()
     return any(hint in lower for hint in CAPACITY_HINTS)
+
+
+def _is_preferred_retryable(status_code: Optional[int], capacity_error: bool) -> bool:
+    """首选渠道失败后是否值得在同一渠道上重试。
+
+    连接错误（status_code=None）和瞬态 5xx/容量错误可以重试；
+    401/403 属于凭证问题，重试不会好转。
+    """
+    if status_code is None:
+        return True
+    if status_code in (401, 403):
+        return False
+    return bool(capacity_error) or status_code in FAILOVER_STATUS or status_code >= 500
+
+
+async def _preferred_retry_sleep(retry_no: int) -> None:
+    """首选渠道重试间的线性退避：第 1 次 0.5s，第 2 次 1.0s，封顶 2s。"""
+    await asyncio.sleep(min(PREFERRED_RETRY_BASE_DELAY_SEC * retry_no, 2.0))
 
 
 def _header_safe(value: Any) -> str:
@@ -429,7 +449,8 @@ async def proxy_responses(
     # Route by client model availability when possible:
     # 1) prefer last cascade winner for this client_model
     # 2) then low→high multiplier within the model's pool
-    # 3) on preferred failure → re-cascade probe (excluding failed ids) and continue
+    # 3) on preferred failure → retry the same channel (transient errors only),
+    #    then re-cascade probe (excluding failed ids) and continue
     route_pool = core.resolve_route_pool(client_model, active)
     failed_ids: set[str] = set()
     cascaded_once = False
@@ -464,13 +485,19 @@ async def proxy_responses(
     client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
     idx = 0
     auth_failovers = 0
+    preferred_retries_left = PREFERRED_RETRY_COUNT
 
     try:
         while idx < len(candidates):
             upstream = candidates[idx]
-            idx += 1
             uid = str(upstream.get("id") or "")
             umodel = core.normalize_model(upstream.get("model"))
+            is_preferred = bool(
+                not cascaded_once
+                and client_model
+                and prefer_name
+                and upstream.get("name") == prefer_name
+            )
             try:
                 resp = await _forward_once(
                     client,
@@ -483,29 +510,39 @@ async def proxy_responses(
                     client_model,
                 )
             except Exception as e:
+                retryable = is_preferred and _is_preferred_retryable(None, False)
+                if retryable and preferred_retries_left > 0:
+                    preferred_retries_left -= 1
+                    retry_no = PREFERRED_RETRY_COUNT - preferred_retries_left
+                    log.warning(
+                        "upstream=%s connection error: %s "
+                        "(preferred retry %d/%d)",
+                        upstream.get("name"),
+                        e,
+                        retry_no,
+                        PREFERRED_RETRY_COUNT,
+                    )
+                    await _preferred_retry_sleep(retry_no)
+                    continue
                 log.warning("upstream=%s connection error: %s", upstream.get("name"), e)
                 if uid:
                     failed_ids.add(uid)
                 probes.mark_model_upstream_failed(
                     client_model, upstream, status=None, error=str(e)
                 )
-                errors.append(
-                    {
-                        "upstream": upstream.get("name"),
-                        "pool": umodel,
-                        "priority": int(upstream.get("priority", 100)),
-                        "multiplier": core.upstream_multiplier_value(upstream),
-                        "status": None,
-                        "error": str(e),
-                        "failover": True,
-                    }
-                )
-                if (
-                    not cascaded_once
-                    and client_model
-                    and prefer_name
-                    and upstream.get("name") == prefer_name
-                ):
+                attempt = {
+                    "upstream": upstream.get("name"),
+                    "pool": umodel,
+                    "priority": int(upstream.get("priority", 100)),
+                    "multiplier": core.upstream_multiplier_value(upstream),
+                    "status": None,
+                    "error": str(e),
+                    "failover": True,
+                }
+                if is_preferred:
+                    attempt["retries"] = PREFERRED_RETRY_COUNT - preferred_retries_left
+                errors.append(attempt)
+                if is_preferred:
                     cascaded_once = True
                     log.info(
                         "re-cascade after connection fail model=%s exclude=%s",
@@ -518,6 +555,8 @@ async def proxy_responses(
                     )
                     prefer_name = candidates[0].get("name") if candidates else None
                     idx = 0
+                else:
+                    idx += 1
                 continue
 
             upstream_url = str(resp.request.url) if resp.request is not None else ""
@@ -802,6 +841,24 @@ async def proxy_responses(
                 failover,
                 err_text[:300],
             )
+            if (
+                is_preferred
+                and failover
+                and _is_preferred_retryable(resp.status_code, capacity_error)
+                and preferred_retries_left > 0
+            ):
+                preferred_retries_left -= 1
+                retry_no = PREFERRED_RETRY_COUNT - preferred_retries_left
+                log.warning(
+                    "upstream=%s status=%s body=%s (preferred retry %d/%d)",
+                    upstream.get("name"),
+                    resp.status_code,
+                    err_text[:300],
+                    retry_no,
+                    PREFERRED_RETRY_COUNT,
+                )
+                await _preferred_retry_sleep(retry_no)
+                continue
             if uid:
                 failed_ids.add(uid)
             probes.mark_model_upstream_failed(
@@ -810,19 +867,20 @@ async def proxy_responses(
                 status=resp.status_code,
                 error=err_text[:500],
             )
-            errors.append(
-                {
-                    "upstream": upstream.get("name"),
-                    "pool": umodel,
-                    "priority": int(upstream.get("priority", 100)),
-                    "multiplier": core.upstream_multiplier_value(upstream),
-                    "url": upstream_url,
-                    "status": resp.status_code,
-                    "error": err_text[:ERROR_LOG_ATTEMPT_BODY_MAX],
-                    "failover": failover,
-                    "capacity_error": capacity_error,
-                }
-            )
+            attempt = {
+                "upstream": upstream.get("name"),
+                "pool": umodel,
+                "priority": int(upstream.get("priority", 100)),
+                "multiplier": core.upstream_multiplier_value(upstream),
+                "url": upstream_url,
+                "status": resp.status_code,
+                "error": err_text[:ERROR_LOG_ATTEMPT_BODY_MAX],
+                "failover": failover,
+                "capacity_error": capacity_error,
+            }
+            if is_preferred:
+                attempt["retries"] = PREFERRED_RETRY_COUNT - preferred_retries_left
+            errors.append(attempt)
             if not failover:
                 eid = record_error(
                     status=resp.status_code,
@@ -851,13 +909,8 @@ async def proxy_responses(
                     },
                 )
 
-            # 首选上游失败：后台重级联，请求本身立刻改走剩余候选，不阻塞 30s 探测。
-            if (
-                not cascaded_once
-                and client_model
-                and prefer_name
-                and upstream.get("name") == prefer_name
-            ):
+            # 首选上游重试耗尽后仍失败：后台重级联，请求改走剩余候选，不阻塞 30s 探测。
+            if is_preferred:
                 cascaded_once = True
                 log.info(
                     "re-cascade after failover model=%s failed=%s exclude=%s",
@@ -871,6 +924,8 @@ async def proxy_responses(
                 )
                 prefer_name = candidates[0].get("name") if candidates else None
                 idx = 0
+            else:
+                idx += 1
         await client.aclose()
     except Exception as e:
         await client.aclose()
@@ -1080,7 +1135,8 @@ async def proxy_anthropic_messages(
             record(status=403, error_log_id=eid)
             raise HTTPException(status_code=403, detail="IP not allowed")
 
-    # 按客户端模型路由：优先可用性缓存胜者，其次倍率低→高，失败则重级联。
+    # 按客户端模型路由：优先可用性缓存胜者，其次倍率低→高；
+    # 首选失败先同渠道重试，重试耗尽才重级联。
     route_pool = core.resolve_route_pool(client_model, active)
     failed_ids: set[str] = set()
     cascaded_once = False
@@ -1114,13 +1170,19 @@ async def proxy_anthropic_messages(
     client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
     idx = 0
     auth_failovers = 0
+    preferred_retries_left = PREFERRED_RETRY_COUNT
 
     try:
         while idx < len(candidates):
             upstream = candidates[idx]
-            idx += 1
             uid = str(upstream.get("id") or "")
             umodel = core.normalize_model(upstream.get("model"))
+            is_preferred = bool(
+                not cascaded_once
+                and client_model
+                and prefer_name
+                and upstream.get("name") == prefer_name
+            )
             # 双模式：上游声明 anthropic_messages 时原生透传（body 用原始 Anthropic 请求），
             # 否则走 Responses 转换层（body 用转换后的 upstream_body）。
             passthrough_mode = bool(upstream.get("anthropic_messages"))
@@ -1148,29 +1210,39 @@ async def proxy_anthropic_messages(
                     passthrough=passthrough_mode,
                 )
             except Exception as e:
+                retryable = is_preferred and _is_preferred_retryable(None, False)
+                if retryable and preferred_retries_left > 0:
+                    preferred_retries_left -= 1
+                    retry_no = PREFERRED_RETRY_COUNT - preferred_retries_left
+                    log.warning(
+                        "upstream=%s connection error: %s "
+                        "(preferred retry %d/%d)",
+                        upstream.get("name"),
+                        e,
+                        retry_no,
+                        PREFERRED_RETRY_COUNT,
+                    )
+                    await _preferred_retry_sleep(retry_no)
+                    continue
                 log.warning("upstream=%s connection error: %s", upstream.get("name"), e)
                 if uid:
                     failed_ids.add(uid)
                 probes.mark_model_upstream_failed(
                     client_model, upstream, status=None, error=str(e)
                 )
-                errors.append(
-                    {
-                        "upstream": upstream.get("name"),
-                        "pool": umodel,
-                        "priority": int(upstream.get("priority", 100)),
-                        "multiplier": core.upstream_multiplier_value(upstream),
-                        "status": None,
-                        "error": str(e),
-                        "failover": True,
-                    }
-                )
-                if (
-                    not cascaded_once
-                    and client_model
-                    and prefer_name
-                    and upstream.get("name") == prefer_name
-                ):
+                attempt = {
+                    "upstream": upstream.get("name"),
+                    "pool": umodel,
+                    "priority": int(upstream.get("priority", 100)),
+                    "multiplier": core.upstream_multiplier_value(upstream),
+                    "status": None,
+                    "error": str(e),
+                    "failover": True,
+                }
+                if is_preferred:
+                    attempt["retries"] = PREFERRED_RETRY_COUNT - preferred_retries_left
+                errors.append(attempt)
+                if is_preferred:
                     cascaded_once = True
                     log.info(
                         "re-cascade after connection fail model=%s exclude=%s",
@@ -1183,6 +1255,8 @@ async def proxy_anthropic_messages(
                     )
                     prefer_name = candidates[0].get("name") if candidates else None
                     idx = 0
+                else:
+                    idx += 1
                 continue
 
             upstream_url = str(resp.request.url) if resp.request is not None else ""
@@ -1623,6 +1697,24 @@ async def proxy_anthropic_messages(
                 failover,
                 err_text[:300],
             )
+            if (
+                is_preferred
+                and failover
+                and _is_preferred_retryable(resp.status_code, capacity_error)
+                and preferred_retries_left > 0
+            ):
+                preferred_retries_left -= 1
+                retry_no = PREFERRED_RETRY_COUNT - preferred_retries_left
+                log.warning(
+                    "upstream=%s status=%s body=%s (preferred retry %d/%d)",
+                    upstream.get("name"),
+                    resp.status_code,
+                    err_text[:300],
+                    retry_no,
+                    PREFERRED_RETRY_COUNT,
+                )
+                await _preferred_retry_sleep(retry_no)
+                continue
             if uid:
                 failed_ids.add(uid)
             probes.mark_model_upstream_failed(
@@ -1631,19 +1723,20 @@ async def proxy_anthropic_messages(
                 status=resp.status_code,
                 error=err_text[:500],
             )
-            errors.append(
-                {
-                    "upstream": upstream.get("name"),
-                    "pool": umodel,
-                    "priority": int(upstream.get("priority", 100)),
-                    "multiplier": core.upstream_multiplier_value(upstream),
-                    "url": upstream_url,
-                    "status": resp.status_code,
-                    "error": err_text[:ERROR_LOG_ATTEMPT_BODY_MAX],
-                    "failover": failover,
-                    "capacity_error": capacity_error,
-                }
-            )
+            attempt = {
+                "upstream": upstream.get("name"),
+                "pool": umodel,
+                "priority": int(upstream.get("priority", 100)),
+                "multiplier": core.upstream_multiplier_value(upstream),
+                "url": upstream_url,
+                "status": resp.status_code,
+                "error": err_text[:ERROR_LOG_ATTEMPT_BODY_MAX],
+                "failover": failover,
+                "capacity_error": capacity_error,
+            }
+            if is_preferred:
+                attempt["retries"] = PREFERRED_RETRY_COUNT - preferred_retries_left
+            errors.append(attempt)
             if not failover:
                 eid = record_error(
                     status=resp.status_code,
@@ -1681,13 +1774,8 @@ async def proxy_anthropic_messages(
                     },
                 )
 
-            # 首选上游失败：后台重级联，请求本身立刻改走剩余候选，不阻塞 30s 探测。
-            if (
-                not cascaded_once
-                and client_model
-                and prefer_name
-                and upstream.get("name") == prefer_name
-            ):
+            # 首选上游重试耗尽后仍失败：后台重级联，请求改走剩余候选，不阻塞 30s 探测。
+            if is_preferred:
                 cascaded_once = True
                 log.info(
                     "re-cascade after failover model=%s failed=%s exclude=%s",
@@ -1701,6 +1789,8 @@ async def proxy_anthropic_messages(
                 )
                 prefer_name = candidates[0].get("name") if candidates else None
                 idx = 0
+            else:
+                idx += 1
         await client.aclose()
     except Exception as e:
         await client.aclose()

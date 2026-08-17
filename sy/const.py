@@ -94,6 +94,10 @@ COLOR_BAD = "#ef4444"
 
 # 代理 failover 状态码与容量提示
 FAILOVER_STATUS = {401, 403, 408, 429, 500, 502, 503, 504}
+# 首选上游在瞬态失败后的同渠道重试次数：首次失败后再重试 2 次（共 3 次尝试），
+# 全部失败才触发重新级联。401/403 等凭证错误不重试。
+PREFERRED_RETRY_COUNT = 2
+PREFERRED_RETRY_BASE_DELAY_SEC = 0.5
 CAPACITY_HINTS = (
     "at capacity",
     "over capacity",
