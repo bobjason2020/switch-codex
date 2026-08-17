@@ -111,11 +111,14 @@
       return DEFAULT_MODEL;
     }
 
+    // 新增上游时标记用户是否手动改过模型行；未改过则切换上游类型时自动重填默认模型
+    let modelMapTouched = false;
+
     function syncUpstreamType() {
       const t = $("upstreamType").value;
       const isPreset = t !== "custom";
       $("modelFields").style.display = isPreset ? "none" : "";
-      if (!$("editId").value && collectModelMap().length === 0) {
+      if (!$("editId").value && !modelMapTouched) {
         renderModelMap(defaultModelMapForType(t));
       }
       if (t === "deepseek" && !$("editId").value) {
@@ -157,12 +160,16 @@
         '<button type="button" class="btn-ghost btn-sm mm-del">删除</button>';
       row.querySelector(".mm-del").onclick = () => {
         row.remove();
+        modelMapTouched = true;
         if (!$("modelMapRows").children.length) addModelMapRow(null);
       };
+      row.querySelector(".mm-model").addEventListener("input", () => { modelMapTouched = true; });
+      row.querySelector(".mm-actual").addEventListener("input", () => { modelMapTouched = true; });
       $("modelMapRows").appendChild(row);
     }
 
     function renderModelMap(entries) {
+      modelMapTouched = false;
       $("modelMapRows").innerHTML = "";
       const list = (entries && entries.length) ? entries : [];
       if (!list.length) addModelMapRow(null);
@@ -179,7 +186,7 @@
       return out;
     }
 
-    $("btnAddModelMap").onclick = () => addModelMapRow(null);
+    $("btnAddModelMap").onclick = () => { modelMapTouched = true; addModelMapRow(null); };
 
     function resetUpstreamForm() {
       $("editId").value = "";
