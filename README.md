@@ -4,6 +4,51 @@ OpenAI **Responses** 风格的多上游 API 路由代理 + 管理 UI，并按 De
 
 中文名「Codex 调度站」：请求像列车一样进站，按模型池调度到不同上游轨道，失败自动换轨（failover）。
 
+## 部署与使用
+
+### 1. 准备环境并启动
+
+运行环境需要 `python3`、`tmux` 和 `curl`。克隆项目后直接启动；脚本会在首次运行时创建 `.venv` 并安装 `requirements.txt` 中的依赖：
+
+```bash
+git clone https://github.com/bobjason2020/switch-codex.git
+cd switch-codex
+./scripts/start.sh
+```
+
+默认监听 `127.0.0.1:4100`，服务运行在独立的 tmux 会话 `switchyard` 中。启动成功后打开 [http://127.0.0.1:4100/](http://127.0.0.1:4100/) 登录管理 UI。
+
+### 2. 配置上游与客户端
+
+首次登录的管理密码是 `admin123`，仅用于本地开箱试用；请在首次登录后立即修改。随后在管理 UI 添加上游的 Base URL、API Key、模型池和模型映射，再选择要启用的模型池。
+
+客户端调用使用管理后台显示的 master key。全新安装的默认值为 `sk-switch-codex`，公开部署前必须在管理 UI 更换为随机值。OpenAI Responses 客户端可按如下方式调用：
+
+```bash
+curl http://127.0.0.1:4100/v1/responses \
+  -H 'Authorization: Bearer <master_key>' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-5.6-luna","input":"Hello"}'
+```
+
+选择 `openai-all` 或 DeepSeek 模型池后，管理 UI 会自动同步本机 Codex 配置；切换完成后新开 Codex 会话即可生效。
+
+### 3. 运维与公网部署
+
+```bash
+./scripts/restart.sh  # 只重启 Switchyard 服务
+./scripts/stop.sh     # 只停止 Switchyard 服务
+tail -f logs/switchyard.tmux.log
+```
+
+调整监听地址或端口时，在启动命令前设置环境变量：
+
+```bash
+SW_HOST=0.0.0.0 SW_PORT=4100 ./scripts/start.sh
+```
+
+默认只允许本机调用。对公网监听或通过反向代理暴露服务时，还必须在管理 UI 的「设置 → 公网调用」中启用公网访问、设置 IP 白名单，并使用高强度的管理密码和 master key。只有在受信任反向代理后面时才开启「信任代理头」。
+
 ## 行为
 
 | 使用模型 | 路由 | Codex `config.toml` / `models.json` |
@@ -23,6 +68,14 @@ OpenAI **Responses** 风格的多上游 API 路由代理 + 管理 UI，并按 De
 Key 仍在上游配置里，**不会**写入 `experimental_bearer_token`。
 首次切换 openai-all / DeepSeek 时自动写入 `~/.codex/auth.json`（`OPENAI_API_KEY = SQLite 中的 master_key`），无需手动配置。
 `data/deepseek-models.json` 缺失时会自动从官方 `codex-deepseek-setup.sh`（cdn.deepseek.com）下载。
+
+## 独立 Web Search
+
+Switchyard 支持 Codex 的独立搜索端点：`POST /v1/alpha/search`。请求保持 OpenAI Responses 格式透传，不会转换为 Chat Completions；它与普通 Responses 请求共用模型池选择、故障切换、日志和公网访问限制。
+
+只有 OpenAI Responses 上游可以承接该请求：上游模型池必须为 `openai-all`，且不能开启「Chat Completions」或「Anthropic Messages」适配。上游的 `standalone_web_search` 字段省略时保持兼容并默认允许；显式设置为 `false` 可排除该上游。
+
+Codex 同步会将受管 `model_providers.simple` 的显示名收敛为 `OpenAI`，并写入 `supports_standalone_web_search = true`。管理 API 可通过 `POST /api/upstreams/{id}/standalone-search-test` 验证上游的 `/alpha/search` 协议支持；该探测只发送最小校验请求，不执行实际网络搜索。
 
 ## 启动
 
@@ -46,7 +99,7 @@ Key 仍在上游配置里，**不会**写入 `experimental_bearer_token`。
 ## Codex
 
 首次在 UI 选择 `openai-all` 或 `DeepSeek` 时，项目会自动把 Codex 配置成走本路由：
-写入 `model_provider = "simple"`、`[model_providers.simple]`（`base_url = http://127.0.0.1:4100/v1`、`wire_api = responses`、`requires_openai_auth = true`）以及 `~/.codex/auth.json`；DeepSeek 还会按官方规则执行 TARGET/DEL keys 并写入官方 `models.json`。全新安装的 Codex 也能直接用。
+写入 `model_provider = "simple"`、`[model_providers.simple]`（`name = "OpenAI"`、`base_url = http://127.0.0.1:4100/v1`、`wire_api = responses`、`requires_openai_auth = true`、`supports_standalone_web_search = true`）以及 `~/.codex/auth.json`；DeepSeek 还会按官方规则执行 TARGET/DEL keys 并写入官方 `models.json`。全新安装的 Codex 也能直接用。
 
 选择「本机原配置」则恢复项目介入前的快照（首次启动时自动生成），Codex 直连原 provider，不经 4100。
 
@@ -140,9 +193,12 @@ static/
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
+| POST | `/v1/responses` | OpenAI Responses 代理端点 |
+| POST | `/v1/alpha/search` | Codex 独立 Web Search 代理端点，仅路由到兼容的 OpenAI Responses 上游 |
 | PUT | `/api/active-model` | `{"active_model":"..."}` 切换池 + 同步 Codex |
 | GET | `/api/models` | 模型池 + codex_sync 类型 |
 | GET | `/api/config` | 含 codex 状态 |
+| POST | `/api/upstreams/{id}/standalone-search-test` | 验证上游的独立 Web Search 协议支持，不执行搜索 |
 | PUT | `/api/grok/config` | `{"mode":"local-direct"\|"grok","model":"grok"}` 切换 Grok CLI 配置 |
 | GET | `/api/logs/models` | 实际调用模型列表及请求次数（来自 `client_model`） |
 | GET | `/api/logs` | 请求日志（`limit/offset/range/start/end/pool/model/status/q`；`range` 支持 `today`/`yesterday`/`3d`/`7d`/`30d`/`custom`，自定义时传 `start`/`end`，status 支持 `success`/`error`/数字） |
@@ -162,9 +218,9 @@ static/
 
 ## 公网调用
 
-默认仅监听本机地址。如需通过公网访问 `/v1/responses`，请在管理后台「设置 → 公网调用」中
+默认仅监听本机地址。如需通过公网访问 `/v1/responses`、`/v1/alpha/search` 或 `/v1/messages`，请在管理后台「设置 → 公网调用」中
 启用公网开关并配置公网地址、IP 黑白名单。
 
 默认**不信任** `X-Forwarded-For` / `cf-connecting-ip` 等代理头，客户端 IP 直接取 socket 对端。
 只有当你把 Switch-codex 放在受信反向代理（如 Cloudflare 隧道）后面时，才应勾选
-「信任代理头」，否则外部请求可以伪造这些头绕过 IP 限制。
+「信任代理头」，否则外部请求可以伪造这些头绕过 IP 限制。该限制同时作用于三个客户端代理端点。
