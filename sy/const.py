@@ -98,6 +98,10 @@ FAILOVER_STATUS = {401, 403, 408, 429, 500, 502, 503, 504}
 # 全部失败才触发重新级联。401/403 等凭证错误不重试。
 PREFERRED_RETRY_COUNT = 2
 PREFERRED_RETRY_BASE_DELAY_SEC = 0.5
+# 流式响应尚未向客户端输出任何字节时的本地快速重试次数。
+# 一旦已经输出内容，不能安全重放同一请求，交由客户端 reconnect。
+STREAM_PREOUTPUT_RETRY_COUNT = 2
+STREAM_RETRY_BASE_DELAY_SEC = 0.5
 CAPACITY_HINTS = (
     "at capacity",
     "over capacity",

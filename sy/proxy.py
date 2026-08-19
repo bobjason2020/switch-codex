@@ -6,7 +6,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -19,12 +19,88 @@ from sy.const import (
     FAILOVER_STATUS,
     PREFERRED_RETRY_BASE_DELAY_SEC,
     PREFERRED_RETRY_COUNT,
+    STREAM_PREOUTPUT_RETRY_COUNT,
+    STREAM_RETRY_BASE_DELAY_SEC,
 )
 
 log = logging.getLogger("switchyard.proxy")
 _iso_now = timeutil.iso_now
 
 router = APIRouter()
+
+
+# These headers describe the client-to-proxy connection or carry credentials
+# that must be replaced for the selected upstream.  Everything else is kept so
+# protocol-specific clients (including Codex compaction) can add headers
+# without requiring a proxy release.
+_HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+_GENERATED_REQUEST_HEADERS = frozenset(
+    {
+        "authorization",
+        "content-length",
+        "host",
+        "x-api-key",
+    }
+)
+_HOP_BY_HOP_RESPONSE_HEADERS = _HOP_BY_HOP_HEADERS | frozenset(
+    {"content-length", "content-encoding", "host"}
+)
+
+
+def _forward_request_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    """Return end-to-end client headers safe to send to an upstream.
+
+    Starlette's ``Headers`` is case-insensitive, but normalize keys here so
+    auth replacement and downstream lookup remain deterministic.  The proxy
+    owns authentication and framing headers; all other client headers are
+    intentionally preserved, including ``x-codex-*`` and custom metadata.
+    """
+    connection_value = next(
+        (value for key, value in headers.items() if str(key).lower() == "connection"),
+        "",
+    )
+    connection_tokens = {
+        token.strip().lower()
+        for token in str(connection_value).split(",")
+        if token.strip()
+    }
+    out: dict[str, str] = {}
+    for key, value in headers.items():
+        name = str(key).lower()
+        if (
+            name in _HOP_BY_HOP_HEADERS
+            or name in connection_tokens
+            or name in _GENERATED_REQUEST_HEADERS
+        ):
+            continue
+        out[name] = str(value)
+    return out
+
+
+def _upstream_response_headers(
+    response: httpx.Response,
+    overrides: Optional[Mapping[str, str]] = None,
+) -> dict[str, str]:
+    """Copy end-to-end upstream headers while leaving framing to Starlette."""
+    out = {
+        str(key).lower(): str(value)
+        for key, value in response.headers.items()
+        if str(key).lower() not in _HOP_BY_HOP_RESPONSE_HEADERS
+    }
+    if overrides:
+        out.update({str(key).lower(): str(value) for key, value in overrides.items()})
+    return out
 
 
 def _is_capacity_error(text: Optional[str]) -> bool:
@@ -187,6 +263,83 @@ async def _aclose_quietly(*objs: Any) -> None:
             pass
 
 
+class _IncompleteStreamError(RuntimeError):
+    """Raised when an upstream stream ends without a terminal event."""
+
+
+async def _stream_with_preoutput_retry(
+    initial_response: httpx.Response,
+    open_retry: Callable[[], Awaitable[httpx.Response]],
+    state: dict[str, Any],
+    consume_attempt: Callable[[httpx.Response], AsyncIterator[bytes]],
+    attempt_complete: Callable[[], bool],
+    label: str,
+) -> AsyncIterator[bytes]:
+    """Retry a stream only while no downstream bytes have been emitted.
+
+    ``consume_attempt`` owns protocol parsing and yields bytes destined for the
+    client.  The helper can therefore distinguish a safe pre-output failure
+    from a partial response that must be left to the client's reconnect logic.
+    """
+    response = initial_response
+    state["response"] = response
+    retry_no = 0
+    while True:
+        try:
+            async for output in consume_attempt(response):
+                if output:
+                    state["downstream_started"] = True
+                    yield output
+            if not attempt_complete():
+                raise _IncompleteStreamError("stream ended before completion")
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if state.get("downstream_started") or retry_no >= STREAM_PREOUTPUT_RETRY_COUNT:
+                raise
+            await _aclose_quietly(response)
+            retry_no += 1
+            state["stream_retries"] = retry_no
+            log.warning(
+                "upstream=%s %s before downstream output: %s "
+                "(stream retry %d/%d)",
+                state.get("upstream") or "?",
+                label,
+                exc,
+                retry_no,
+                STREAM_PREOUTPUT_RETRY_COUNT,
+            )
+            await asyncio.sleep(
+                min(STREAM_RETRY_BASE_DELAY_SEC * retry_no, 2.0)
+            )
+            response = await open_retry()
+            state["response"] = response
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"stream retry returned HTTP {response.status_code}"
+                )
+
+
+def _responses_stream_terminal_line(line: str) -> bool:
+    text = line.strip()
+    if not text.startswith("data:"):
+        return False
+    data = text[5:].strip()
+    if data == "[DONE]":
+        return True
+    if not data.startswith("{"):
+        return False
+    try:
+        obj = json.loads(data)
+    except Exception:
+        return False
+    return isinstance(obj, dict) and obj.get("type") in {
+        "response.completed",
+        "response.failed",
+    }
+
+
 def _live_ok_payload(
     client_model: str, route_pool: str, upstream: dict, status_code: int
 ) -> dict:
@@ -271,7 +424,7 @@ async def _forward_once(
     path_suffix: str,
     body: bytes,
     content_type: str,
-    extra_headers: dict[str, str],
+    extra_headers: Mapping[str, str],
     client_model: Optional[str] = None,
     passthrough: bool = False,
 ) -> httpx.Response:
@@ -297,23 +450,21 @@ async def _forward_once(
         url = _build_upstream_url(upstream["base_url"], path_suffix)
         request_model = core.upstream_request_model(upstream, client_model)
         body = _rewrite_request_model(body, request_model)
-    headers = {
-        "Content-Type": content_type or "application/json",
-    }
+    headers = _forward_request_headers(extra_headers)
+    headers["content-type"] = content_type or headers.get(
+        "content-type", "application/json"
+    )
     if passthrough:
         # Anthropic 原生端点用 x-api-key 认证（与 Anthropic 官方一致）
         headers["x-api-key"] = upstream["api_key"]
         # anthropic-version：客户端有则透传，缺失补默认值（借鉴 cc-switch forwarder）
         headers["anthropic-version"] = (
-            extra_headers.get("anthropic-version") or "2023-06-01"
+            headers.get("anthropic-version") or "2023-06-01"
         )
-        if extra_headers.get("anthropic-beta"):
-            headers["anthropic-beta"] = extra_headers["anthropic-beta"]
+        if headers.get("anthropic-beta"):
+            headers["anthropic-beta"] = headers["anthropic-beta"]
     else:
         headers["Authorization"] = f"Bearer {upstream['api_key']}"
-        for k in ("accept", "openai-beta"):
-            if k in extra_headers:
-                headers[k] = extra_headers[k]
     log.info(
         "try upstream=%s pool=%s request_model=%s priority=%s %s %s",
         upstream.get("name"),
@@ -345,11 +496,7 @@ async def proxy_responses(
     is_public_request = _is_public_request(request, trust_proxy_headers)
     body = await request.body()
     content_type = request.headers.get("content-type", "application/json")
-    extra = {
-        k.lower(): v
-        for k, v in request.headers.items()
-        if k.lower() in ("accept", "openai-beta", "anthropic-beta")
-    }
+    extra = _forward_request_headers(request.headers)
     req_body, req_body_len, req_body_trunc = logbook._request_body_for_log(body)
 
     method = request.method.upper()
@@ -387,6 +534,11 @@ async def proxy_responses(
         ttft_ms: Optional[float] = None,
         endpoint: Optional[str] = None,
         upstream_id: Optional[str] = None,
+        stream_completed: Optional[bool] = None,
+        stream_error: Optional[str] = None,
+        client_disconnect: Optional[bool] = None,
+        downstream_started: Optional[bool] = None,
+        stream_retries: Optional[int] = None,
     ) -> None:
         logbook._record_log(
             client_ip=client_ip,
@@ -411,6 +563,11 @@ async def proxy_responses(
             error_log_id=error_log_id,
             attempts=attempts,
             stream=stream,
+            stream_completed=stream_completed,
+            stream_error=stream_error,
+            client_disconnect=client_disconnect,
+            downstream_started=downstream_started,
+            stream_retries=stream_retries,
             **logbook._usage_numbers(usage),
         )
 
@@ -679,13 +836,20 @@ async def proxy_responses(
                                 upstream_id=up.get("id"),
                             )
 
-                    out_headers = _stream_headers({
-                        "content-type": "text/event-stream",
-                        "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
-                        "x-switch-codex-pool": _header_safe(umodel),
-                        "x-switch-codex-route-pool": _header_safe(route_pool),
-                        "x-switch-codex-active-model": _header_safe(active),
-                    })
+                    out_headers = _stream_headers(
+                        _upstream_response_headers(
+                            resp,
+                            {
+                                "content-type": "text/event-stream",
+                                "x-switch-codex-upstream": _header_safe(
+                                    upstream.get("name", "")
+                                ),
+                                "x-switch-codex-pool": _header_safe(umodel),
+                                "x-switch-codex-route-pool": _header_safe(route_pool),
+                                "x-switch-codex-active-model": _header_safe(active),
+                            },
+                        )
+                    )
                     if client_model is not None:
                         out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
                     return StreamingResponse(
@@ -761,69 +925,137 @@ async def proxy_responses(
                     uurl=upstream_url,
                     arrived=arrived_ms,
                 ):
-                    sink = _UsageSink()
-                    sse_buf = _SseLineBuffer()
-                    stream_error = None
-                    client_disconnect = False
-                    first_ms = None
+                    state: dict[str, Any] = {
+                        "response": r,
+                        "upstream": up.get("name"),
+                        "downstream_started": False,
+                        "stream_retries": 0,
+                        "stream_completed": False,
+                        "stream_error": None,
+                        "client_disconnect": False,
+                        "usage": None,
+                        "ttft_ms": None,
+                    }
+
+                    async def open_retry() -> httpx.Response:
+                        return await _forward_once(
+                            c,
+                            up,
+                            method,
+                            path_suffix,
+                            body,
+                            content_type,
+                            extra,
+                            client_model,
+                        )
+
+                    async def consume_attempt(
+                        attempt_response: httpx.Response,
+                    ) -> AsyncIterator[bytes]:
+                        sink = _UsageSink()
+                        sse_buf = _SseLineBuffer()
+                        first_ms = None
+                        completed = False
+                        try:
+                            async for chunk in attempt_response.aiter_bytes():
+                                if first_ms is None:
+                                    first_ms = (time.perf_counter() - t0) * 1000.0
+                                if chunk:
+                                    for line in sse_buf.feed(chunk):
+                                        sink.feed_line(line)
+                                        completed = (
+                                            completed or _responses_stream_terminal_line(line)
+                                        )
+                                    yield chunk
+                            leftover = sse_buf.flush()
+                            if leftover:
+                                sink.feed_line(leftover)
+                                completed = (
+                                    completed or _responses_stream_terminal_line(leftover)
+                                )
+                        finally:
+                            state["usage"] = sink.usage
+                            state["stream_completed"] = completed
+                            if first_ms is not None and state["ttft_ms"] is None:
+                                state["ttft_ms"] = first_ms
+
                     try:
-                        async for chunk in r.aiter_bytes():
-                            if first_ms is None:
-                                first_ms = (time.perf_counter() - t0) * 1000.0
-                            if chunk:
-                                for line in sse_buf.feed(chunk):
-                                    sink.feed_line(line)
-                                yield chunk
+                        async for chunk in _stream_with_preoutput_retry(
+                            r,
+                            open_retry,
+                            state,
+                            consume_attempt,
+                            lambda: bool(state["stream_completed"]),
+                            "stream failure",
+                        ):
+                            yield chunk
                     except asyncio.CancelledError:
-                        client_disconnect = True
+                        state["client_disconnect"] = True
+                        raise
+                    except GeneratorExit:
+                        state["client_disconnect"] = True
                         raise
                     except Exception as e:
-                        stream_error = f"stream aborted: {e}"
-                        try:
-                            yield _sse_error_bytes(str(e))
-                        except Exception:
-                            pass
+                        state["stream_error"] = f"stream aborted: {e}"
+                        # With no downstream bytes, end the stream bare so the
+                        # Codex client can enter its own reconnect path. Once
+                        # output has started, preserve the existing error SSE.
+                        if state["downstream_started"]:
+                            try:
+                                yield _sse_error_bytes(str(e))
+                            except Exception:
+                                pass
                     finally:
-                        leftover = sse_buf.flush()
-                        if leftover:
-                            sink.feed_line(leftover)
-                        await _aclose_quietly(r, c)
+                        active_response = state["response"]
+                        await _aclose_quietly(active_response, c)
                         stream_err_log_id = None
-                        ok = stream_error is None
-                        if stream_error and not client_disconnect:
+                        ok = bool(state["stream_completed"]) and not state["stream_error"]
+                        if state["stream_error"] and not state["client_disconnect"]:
                             stream_err_log_id = record_error(
-                                status=r.status_code,
-                                error=stream_error,
+                                status=active_response.status_code,
+                                error=state["stream_error"],
                                 attempts=list(errors),
                             )
-                        if ok and not client_disconnect and client_model:
+                        if ok and not state["client_disconnect"] and client_model:
                             probes._set_model_availability(
                                 str(client_model),
                                 _live_ok_payload(
-                                    str(client_model), route_pool, up, r.status_code
+                                    str(client_model), route_pool, up, active_response.status_code
                                 ),
                             )
                         record(
-                            status=r.status_code,
+                            status=active_response.status_code,
                             upstream=up.get("name"),
                             url=uurl,
                             multiplier=core.upstream_multiplier_value(up),
                             error_log_id=stream_err_log_id,
                             attempts=list(errors) if errors else None,
-                            usage=sink.usage,
+                            usage=state["usage"],
                             duration_ms=(time.perf_counter() - t0) * 1000.0,
-                            ttft_ms=first_ms if first_ms is not None else arrived,
+                            ttft_ms=state["ttft_ms"] if state["ttft_ms"] is not None else arrived,
                             upstream_id=up.get("id"),
+                            stream_completed=bool(state["stream_completed"]),
+                            stream_error=state["stream_error"],
+                            client_disconnect=bool(state["client_disconnect"]),
+                            downstream_started=bool(state["downstream_started"]),
+                            stream_retries=int(state["stream_retries"] or 0),
                         )
 
-                out_headers = _stream_headers({})
                 ct = resp.headers.get("content-type")
-                if ct:
-                    out_headers["content-type"] = ct
-                out_headers["x-switch-codex-upstream"] = _header_safe(upstream.get("name", ""))
-                out_headers["x-switch-codex-pool"] = _header_safe(umodel)
-                out_headers["x-switch-codex-route-pool"] = _header_safe(route_pool)
-                out_headers["x-switch-codex-active-model"] = _header_safe(active)
+                out_headers = _stream_headers(
+                    _upstream_response_headers(
+                        resp,
+                        {
+                            "content-type": ct or "text/event-stream",
+                            "x-switch-codex-upstream": _header_safe(
+                                upstream.get("name", "")
+                            ),
+                            "x-switch-codex-pool": _header_safe(umodel),
+                            "x-switch-codex-route-pool": _header_safe(route_pool),
+                            "x-switch-codex-active-model": _header_safe(active),
+                        },
+                    )
+                )
                 if client_model is not None:
                     out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
                 return StreamingResponse(
@@ -833,6 +1065,7 @@ async def proxy_responses(
                     media_type=ct,
                 )
 
+            upstream_headers = _upstream_response_headers(resp)
             err_text = (await resp.aread()).decode("utf-8", errors="replace")
             await resp.aclose()
             capacity_error = _is_capacity_error(err_text)
@@ -919,7 +1152,10 @@ async def proxy_responses(
                     status_code=resp.status_code,
                     media_type=resp.headers.get("content-type", "application/json"),
                     headers={
-                        "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
+                        **upstream_headers,
+                        "x-switch-codex-upstream": _header_safe(
+                            upstream.get("name", "")
+                        ),
                         "x-switch-codex-pool": _header_safe(umodel),
                         "x-switch-codex-route-pool": _header_safe(route_pool),
                         "x-switch-codex-active-model": _header_safe(active),
@@ -1014,11 +1250,7 @@ async def proxy_anthropic_messages(
     is_public_request = _is_public_request(request, trust_proxy_headers)
     body = await request.body()
     content_type = request.headers.get("content-type", "application/json")
-    extra = {
-        k.lower(): v
-        for k, v in request.headers.items()
-        if k.lower() in ("accept", "openai-beta", "anthropic-version", "anthropic-beta")
-    }
+    extra = _forward_request_headers(request.headers)
 
     log_path = "/v1/messages"
     method = "POST"
@@ -1053,6 +1285,11 @@ async def proxy_anthropic_messages(
         duration_ms: Optional[float] = None,
         ttft_ms: Optional[float] = None,
         upstream_id: Optional[str] = None,
+        stream_completed: Optional[bool] = None,
+        stream_error: Optional[str] = None,
+        client_disconnect: Optional[bool] = None,
+        downstream_started: Optional[bool] = None,
+        stream_retries: Optional[int] = None,
     ) -> None:
         logbook._record_log(
             client_ip=client_ip,
@@ -1077,6 +1314,11 @@ async def proxy_anthropic_messages(
             error_log_id=error_log_id,
             attempts=attempts,
             stream=stream,
+            stream_completed=stream_completed,
+            stream_error=stream_error,
+            client_disconnect=client_disconnect,
+            downstream_started=downstream_started,
+            stream_retries=stream_retries,
             **logbook._usage_numbers(usage),
         )
 
@@ -1359,13 +1601,20 @@ async def proxy_anthropic_messages(
                                     upstream_id=up.get("id"),
                                 )
 
-                        out_headers = _stream_headers({
-                            "content-type": out_ct or "text/event-stream",
-                            "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
-                            "x-switch-codex-pool": _header_safe(umodel),
-                            "x-switch-codex-route-pool": _header_safe(route_pool),
-                            "x-switch-codex-active-model": _header_safe(active),
-                        })
+                        out_headers = _stream_headers(
+                            _upstream_response_headers(
+                                resp,
+                                {
+                                    "content-type": out_ct or "text/event-stream",
+                                    "x-switch-codex-upstream": _header_safe(
+                                        upstream.get("name", "")
+                                    ),
+                                    "x-switch-codex-pool": _header_safe(umodel),
+                                    "x-switch-codex-route-pool": _header_safe(route_pool),
+                                    "x-switch-codex-active-model": _header_safe(active),
+                                },
+                            )
+                        )
                         if client_model is not None:
                             out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
                         return StreamingResponse(
@@ -1374,6 +1623,7 @@ async def proxy_anthropic_messages(
                             headers=out_headers,
                             media_type=out_ct or "text/event-stream",
                         )
+                    upstream_headers = _upstream_response_headers(resp)
                     raw = await resp.aread()
                     await resp.aclose()
                     usage = logbook._extract_usage(raw)
@@ -1396,6 +1646,7 @@ async def proxy_anthropic_messages(
                         upstream_id=upstream.get("id"),
                     )
                     out_headers = {
+                        **upstream_headers,
                         "content-type": resp.headers.get("content-type", "application/json"),
                         "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
                         "x-switch-codex-pool": _header_safe(umodel),
@@ -1579,6 +1830,7 @@ async def proxy_anthropic_messages(
                     )
 
                 # 非流式：上游返回 JSON（含客户端 stream=true 但上游非流式的兜底）。
+                upstream_headers = _upstream_response_headers(resp)
                 raw = await resp.aread()
                 await resp.aclose()
                 try:
@@ -1652,6 +1904,7 @@ async def proxy_anthropic_messages(
                     )
                     sse_events = anthropic.responses_json_to_anthropic_sse(resp_obj, req_payload)
                     out_headers = {
+                        **upstream_headers,
                         "content-type": "text/event-stream",
                         "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
                         "x-switch-codex-pool": _header_safe(umodel),
@@ -1682,6 +1935,7 @@ async def proxy_anthropic_messages(
                     upstream_id=upstream.get("id"),
                 )
                 out_headers = {
+                    **upstream_headers,
                     "content-type": "application/json",
                     "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
                     "x-switch-codex-pool": _header_safe(umodel),
@@ -1698,6 +1952,7 @@ async def proxy_anthropic_messages(
                     headers=out_headers,
                 )
 
+            upstream_headers = _upstream_response_headers(resp)
             err_text = (await resp.aread()).decode("utf-8", errors="replace")
             await resp.aclose()
             capacity_error = _is_capacity_error(err_text)
@@ -1784,11 +2039,13 @@ async def proxy_anthropic_messages(
                         ),
                         ensure_ascii=False,
                     )
+                    upstream_headers["content-type"] = "application/json"
                 return Response(
                     content=err_text.encode("utf-8"),
                     status_code=resp.status_code,
                     media_type="application/json",
                     headers={
+                        **upstream_headers,
                         "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
                         "x-switch-codex-pool": _header_safe(umodel),
                         "x-switch-codex-route-pool": _header_safe(route_pool),
