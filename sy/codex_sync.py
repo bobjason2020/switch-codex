@@ -56,10 +56,13 @@ OPENAI_SNAP_MANIFEST = OPENAI_SNAP_DIR / "manifest.json"
 
 SIMPLE_PROVIDER_BASE_URL = provider_base_url()
 SIMPLE_PROVIDER_KEYS = (
-    ("name", '"simple"'),
+    # The table key remains ``simple`` for Switchyard compatibility; Codex
+    # uses the provider display name to select OpenAI's standalone search path.
+    ("name", '"OpenAI"'),
     ("base_url", f'"{SIMPLE_PROVIDER_BASE_URL}"'),
     ("wire_api", '"responses"'),
     ("requires_openai_auth", "true"),
+    ("supports_standalone_web_search", "true"),
 )
 
 TARGET_KEYS = (
@@ -301,12 +304,26 @@ def _ensure_simple_provider(text: str) -> tuple[str, list[str]]:
         k = _key_of(lines[j])
         if k:
             keys_present.add(k)
+    report: list[str] = []
+    desired = dict(SIMPLE_PROVIDER_KEYS)
+    # Managed provider fields must converge even when an older Switchyard
+    # version already wrote a stale value (especially name="simple").
+    for j in range(body_start, end):
+        k = _key_of(lines[j])
+        if k not in desired or "=" not in lines[j]:
+            continue
+        old = _trim(lines[j].split("=", 1)[1])
+        new = desired[k]
+        if old != new:
+            indent = lines[j][: len(lines[j]) - len(lines[j].lstrip())]
+            lines[j] = f"{indent}{k} = {new}"
+            report.append(f"[model_providers.simple] {k}: {old} → {new}")
     missing = [kv for kv in SIMPLE_PROVIDER_KEYS if kv[0] not in keys_present]
     if missing:
         insert = [f"{k} = {v}" for k, v in missing]
         lines[end:end] = insert
-        return "\n".join(lines), ["[model_providers.simple] 补全: " + ", ".join(k for k, _ in missing)]
-    return "\n".join(lines), []
+        report.append("[model_providers.simple] 补全: " + ", ".join(k for k, _ in missing))
+    return "\n".join(lines), report
 
 
 def _write_client_auth() -> bool:
