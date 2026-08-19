@@ -596,6 +596,21 @@ def upstream_supports_model(upstream: dict, client_model: Optional[str]) -> bool
     return any(str(e.get("model") or "").strip() == cm for e in entries)
 
 
+def upstream_supports_standalone_web_search(upstream: dict) -> bool:
+    """Whether an upstream can receive Codex's standalone search request.
+
+    The endpoint is an OpenAI Responses-side capability. Chat and Anthropic
+    adapters cannot preserve its request/response contract, so they are
+    intentionally excluded. ``standalone_web_search=False`` is an explicit
+    operator opt-out; absent metadata keeps legacy OpenAI upstreams usable.
+    """
+    if bool(upstream.get("chat_completions")) or bool(upstream.get("anthropic_messages")):
+        return False
+    if upstream.get("standalone_web_search") is False:
+        return False
+    return normalize_model(upstream.get("model")) == DEFAULT_MODEL
+
+
 def upstream_request_model(
     upstream: dict, client_model: Optional[str] = None
 ) -> Optional[str]:
@@ -929,6 +944,11 @@ def public_upstream(u: dict, health_map: Optional[dict[str, dict]] = None) -> di
         "probe_enabled": upstream_probe_enabled(u),
         "chat_completions": bool(u.get("chat_completions", False)),
         "anthropic_messages": bool(u.get("anthropic_messages", False)),
+        "standalone_web_search": (
+            None
+            if u.get("standalone_web_search") is None
+            else bool(u.get("standalone_web_search"))
+        ),
         "ratio_source": u.get("ratio_source") or None,
         "ratio_group": u.get("ratio_group") or None,
         "status": status,

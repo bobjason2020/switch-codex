@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from sy.auth import _keys_equal
 from sy.logbook import _extract_reasoning_effort, _extract_session_id
 from sy.proxy import _safe_responses_path
+from sy.core import upstream_supports_standalone_web_search
 
 
 class KeyCompareTests(unittest.TestCase):
@@ -40,6 +41,21 @@ class ResponsesPathTests(unittest.TestCase):
 
     def test_accept_safe_id(self):
         self.assertEqual(_safe_responses_path("resp_abc-1", "GET"), "responses/resp_abc-1")
+
+
+class StandaloneSearchCapabilityTests(unittest.TestCase):
+    def test_openai_responses_upstream_is_supported_by_default(self):
+        self.assertTrue(upstream_supports_standalone_web_search({"model": "openai"}))
+
+    def test_adapters_are_excluded(self):
+        self.assertFalse(upstream_supports_standalone_web_search({"model": "openai", "chat_completions": True}))
+        self.assertFalse(upstream_supports_standalone_web_search({"model": "openai", "anthropic_messages": True}))
+
+    def test_explicit_opt_out(self):
+        self.assertFalse(upstream_supports_standalone_web_search({"model": "openai", "standalone_web_search": False}))
+
+    def test_non_openai_pool_is_excluded(self):
+        self.assertFalse(upstream_supports_standalone_web_search({"model": "grok"}))
 
 
 class GrokSessionAndEffortTests(unittest.TestCase):

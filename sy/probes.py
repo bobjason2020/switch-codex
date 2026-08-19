@@ -406,6 +406,67 @@ async def _probe_upstream(
     return result
 
 
+async def probe_standalone_web_search(
+    target: dict, *, timeout: Optional[float] = None
+) -> dict[str, Any]:
+    """Probe the OpenAI standalone search endpoint without invoking a search.
+
+    ``/alpha/search`` validates the standalone protocol before doing work. A
+    minimal request therefore lets the dashboard distinguish route support
+    from an ordinary Responses probe without charging a web search.
+    """
+    if not core.upstream_supports_standalone_web_search(target):
+        return {
+            "ok": False,
+            "supported": False,
+            "status_code": None,
+            "error": "upstream is not an OpenAI Responses provider",
+            "upstream": target.get("name"),
+        }
+    timeout = float(timeout or min(float(core.load_config().get("timeout_sec", 120)), 20.0))
+    model = core.upstream_request_model(target, "gpt-5.6-sol") or "gpt-5.6-sol"
+    payload = {"id": "switchyard-capability-probe", "model": model, "input": "OK"}
+    url = str(target.get("base_url") or "").rstrip("/") + "/alpha/search"
+    t0 = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            resp = await client.post(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {target.get('api_key') or ''}",
+                    "Content-Type": "application/json",
+                },
+            )
+            raw = await resp.aread()
+        text = raw.decode("utf-8", errors="replace")
+        # 2xx means the endpoint understands the protocol. Some gateways
+        # return a structured validation result rather than a search result.
+        supported = 200 <= resp.status_code < 300
+        return {
+            "ok": supported,
+            "supported": supported,
+            "status_code": resp.status_code,
+            "upstream": target.get("name"),
+            "url": url,
+            "model": model,
+            "duration_ms": round((time.perf_counter() - t0) * 1000.0, 1),
+            "body_preview": text[:1000],
+            "error": None if supported else text[:500],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "supported": False,
+            "status_code": None,
+            "upstream": target.get("name"),
+            "url": url,
+            "model": model,
+            "duration_ms": round((time.perf_counter() - t0) * 1000.0, 1),
+            "error": str(exc),
+        }
+
+
 def _seconds_until_next_clock_boundary(interval_sec: int = 300) -> float:
     interval_sec = max(30, int(interval_sec))
     now = time.time()

@@ -280,7 +280,10 @@ async def _forward_once(
         url = _build_upstream_url(upstream["base_url"], "messages")
         request_model = None
     else:
-        chat_mode = bool(upstream.get("chat_completions"))
+        # Standalone search has its own OpenAI endpoint and must remain a
+        # Responses-native payload; converting it to Chat Completions breaks
+        # Codex's search protocol.
+        chat_mode = bool(upstream.get("chat_completions")) and path_suffix != "alpha/search"
         if chat_mode:
             path_suffix = "chat/completions"
             try:
@@ -324,6 +327,7 @@ async def _forward_once(
     return await client.send(req, stream=True)
 
 
+@router.api_route("/v1/alpha/search", methods=["POST"])
 @router.api_route("/v1/responses", methods=["POST"])
 @router.api_route("/v1/responses/{path:path}", methods=["GET", "POST", "DELETE"])
 async def proxy_responses(
@@ -349,8 +353,9 @@ async def proxy_responses(
     req_body, req_body_len, req_body_trunc = logbook._request_body_for_log(body)
 
     method = request.method.upper()
-    path_suffix = _safe_responses_path(path, method)
-    log_path = f"/v1/responses/{path}" if path else "/v1/responses"
+    standalone_search = request.url.path == "/v1/alpha/search"
+    path_suffix = "alpha/search" if standalone_search else _safe_responses_path(path, method)
+    log_path = "/v1/alpha/search" if standalone_search else (f"/v1/responses/{path}" if path else "/v1/responses")
 
     # client model + stream + reasoning effort if present (passthrough — no rewrite)
     client_model = None
@@ -455,10 +460,18 @@ async def proxy_responses(
     failed_ids: set[str] = set()
     cascaded_once = False
     candidates = core.order_candidates_for_model(client_model, route_pool)
+    if standalone_search:
+        candidates = [
+            u for u in candidates if core.upstream_supports_standalone_web_search(u)
+        ]
     if not candidates:
         # Fall back to active pool if client model maps to an empty pool.
         route_pool = active
         candidates = core.order_candidates_for_model(client_model, route_pool)
+        if standalone_search:
+            candidates = [
+                u for u in candidates if core.upstream_supports_standalone_web_search(u)
+            ]
     if not candidates:
         eid = record_error(status=503, error="no enabled upstreams for route pool")
         record(status=503, error_log_id=eid)
@@ -894,7 +907,11 @@ async def proxy_responses(
                     multiplier=core.upstream_multiplier_value(upstream),
                     error_log_id=eid,
                     attempts=list(errors) if errors else None,
-                    endpoint="chat" if upstream.get("chat_completions") else None,
+                    endpoint=(
+                        "search"
+                        if standalone_search
+                        else ("chat" if upstream.get("chat_completions") else None)
+                    ),
                 )
                 await client.aclose()
                 return Response(
@@ -922,6 +939,11 @@ async def proxy_responses(
                 candidates = core.order_candidates_for_model(
                     client_model, route_pool, exclude_ids=set(failed_ids)
                 )
+                if standalone_search:
+                    candidates = [
+                        u for u in candidates
+                        if core.upstream_supports_standalone_web_search(u)
+                    ]
                 prefer_name = candidates[0].get("name") if candidates else None
                 idx = 0
             else:

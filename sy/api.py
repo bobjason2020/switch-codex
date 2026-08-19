@@ -100,6 +100,7 @@ class UpstreamIn(BaseModel):
     probe_enabled: Optional[bool] = None
     chat_completions: Optional[bool] = None
     anthropic_messages: Optional[bool] = None
+    standalone_web_search: Optional[bool] = None
 
 
 class UpstreamUpdate(BaseModel):
@@ -114,6 +115,7 @@ class UpstreamUpdate(BaseModel):
     probe_enabled: Optional[bool] = None
     chat_completions: Optional[bool] = None
     anthropic_messages: Optional[bool] = None
+    standalone_web_search: Optional[bool] = None
 
 
 class ActiveModelIn(BaseModel):
@@ -557,6 +559,7 @@ async def create_upstream(body: UpstreamIn, _: str = Depends(auth.require_master
         "probe_enabled": probe_enabled,
         "chat_completions": bool(body.chat_completions),
         "anthropic_messages": bool(body.anthropic_messages),
+        "standalone_web_search": body.standalone_web_search,
     }
     items.append(item)
     core.save_upstreams(items)
@@ -606,6 +609,12 @@ async def update_upstream(uid: str, body: UpstreamUpdate, _: str = Depends(auth.
                 u["chat_completions"] = bool(data["chat_completions"])
             if "anthropic_messages" in data and data["anthropic_messages"] is not None:
                 u["anthropic_messages"] = bool(data["anthropic_messages"])
+            if "standalone_web_search" in data:
+                u["standalone_web_search"] = (
+                    None
+                    if data["standalone_web_search"] is None
+                    else bool(data["standalone_web_search"])
+                )
             core.save_upstreams(items)
             return core.public_upstream(u)
     raise HTTPException(status_code=404, detail="upstream not found")
@@ -758,6 +767,14 @@ async def test_upstream(uid: str, _: str = Depends(auth.require_master)):
     if result.get("error"):
         out["error"] = result["error"]
     return out
+
+
+@router.post("/api/upstreams/{uid}/standalone-search-test")
+async def test_upstream_standalone_search(uid: str, _: str = Depends(auth.require_master)):
+    target = next((u for u in core.load_upstreams() if u.get("id") == uid), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="upstream not found")
+    return await probes.probe_standalone_web_search(target)
 
 
 # ---------- request logs ----------
