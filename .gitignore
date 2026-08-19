@@ -11,6 +11,9 @@ __pycache__/
 # Runtime logs
 logs/
 
+# Local utility scripts and temporary output
+tmp/
+
 # Local state & secrets (upstream API keys, master key, request history, codex backup)
 data/
 
