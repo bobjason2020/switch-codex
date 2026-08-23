@@ -425,7 +425,20 @@ async def probe_standalone_web_search(
         }
     timeout = float(timeout or min(float(core.load_config().get("timeout_sec", 120)), 20.0))
     model = core.upstream_request_model(target, "gpt-5.6-sol") or "gpt-5.6-sol"
-    payload = {"id": "switchyard-capability-probe", "model": model, "input": "OK"}
+    # The endpoint rejects an otherwise valid request with an "empty calls"
+    # error. Include the smallest real search command so capability probing
+    # exercises the same protocol as production requests.
+    payload = {
+        "id": "switchyard-capability-probe",
+        "model": model,
+        "input": "OK",
+        "commands": {
+            "search_query": [{"q": "site:example.com switchyard capability probe"}],
+            "response_length": "short",
+        },
+        "settings": {"allowed_callers": ["direct"], "external_web_access": False},
+        "max_output_tokens": 16,
+    }
     url = str(target.get("base_url") or "").rstrip("/") + "/alpha/search"
     t0 = time.perf_counter()
     try:
