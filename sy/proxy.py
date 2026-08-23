@@ -918,6 +918,55 @@ async def proxy_responses(
                         headers=out_headers,
                     )
 
+                # Standalone search providers may return a complete JSON
+                # envelope (encrypted_output/output/results) instead of an
+                # SSE Responses stream. Preserve that envelope byte-for-byte;
+                # treating it as SSE makes a successful upstream response look
+                # like "stream ended before completion" to the client.
+                if standalone_search and "application/json" in resp.headers.get(
+                    "content-type", ""
+                ).lower():
+                    raw = await resp.aread()
+                    await resp.aclose()
+                    usage = logbook._extract_usage(raw)
+                    if client_model:
+                        probes._set_model_availability(
+                            str(client_model),
+                            _live_ok_payload(
+                                str(client_model), route_pool, upstream, resp.status_code
+                            ),
+                        )
+                    record(
+                        status=resp.status_code,
+                        upstream=upstream.get("name"),
+                        url=upstream_url,
+                        multiplier=core.upstream_multiplier_value(upstream),
+                        attempts=list(errors) if errors else None,
+                        usage=usage,
+                        duration_ms=(time.perf_counter() - t0) * 1000.0,
+                        ttft_ms=arrived_ms,
+                        endpoint="search",
+                        upstream_id=upstream.get("id"),
+                    )
+                    out_headers = _upstream_response_headers(resp)
+                    out_headers.update(
+                        {
+                            "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
+                            "x-switch-codex-pool": _header_safe(umodel),
+                            "x-switch-codex-route-pool": _header_safe(route_pool),
+                            "x-switch-codex-active-model": _header_safe(active),
+                        }
+                    )
+                    if client_model is not None:
+                        out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
+                    await client.aclose()
+                    return Response(
+                        content=raw,
+                        status_code=resp.status_code,
+                        headers=out_headers,
+                        media_type=resp.headers.get("content-type", "application/json"),
+                    )
+
                 async def stream_body(
                     r=resp,
                     c=client,
