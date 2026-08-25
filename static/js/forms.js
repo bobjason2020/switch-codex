@@ -198,7 +198,6 @@
       $("multiplier").value = "";
       renderModelMap([]);
       $("enabled").checked = true;
-      $("chatCompletions").checked = false;
       $("anthropicMessages").checked = false;
       $("modelCustom").value = "";
       fillPoolSelect($("modelSelect"), DEFAULT_MODEL);
@@ -218,7 +217,6 @@
       $("priority").value = u ? u.priority : "100";
       $("multiplier").value = u ? (u.multiplier ?? 1) : "";
       $("enabled").checked = u ? !!u.enabled : true;
-      $("chatCompletions").checked = u ? !!u.chat_completions : false;
       $("anthropicMessages").checked = u ? !!u.anthropic_messages : false;
       $("modelCustom").value = "";
       fillPoolSelect($("modelSelect"), u ? (u.model || DEFAULT_MODEL) : DEFAULT_MODEL);

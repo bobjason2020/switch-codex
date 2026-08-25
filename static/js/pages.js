@@ -416,6 +416,7 @@
       const st = a.status == null
         ? '<span class="pill off">ERR</span>'
         : statusPill(a.status);
+      // 纯透传：不做 failover，选中上游失败即原样返回。
       const flag = a.failover
         ? '<span class="failover-yes">✓ 已切换下一个上游</span>'
         : '<span class="failover-no">✗ 未切换（直接返回错误）</span>';
@@ -457,7 +458,7 @@
             ${collapsibleError(e.error || "")}
           </div>
           <div class="err-section">
-            <h4>上游尝试记录（${(e.attempts || []).length}）</h4>
+            <h4>上游记录（${(e.attempts || []).length}）</h4>
             ${attempts || '<div class="muted">无</div>'}
           </div>
           <div class="err-section">
@@ -989,7 +990,6 @@
         base_url: storedUrl($("base_url").value),
         priority: Number($("priority").value || 100),
         enabled: $("enabled").checked,
-        chat_completions: $("chatCompletions").checked,
         anthropic_messages: $("anthropicMessages").checked,
         model,
         model_map: collectModelMap(),

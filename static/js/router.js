@@ -12,7 +12,7 @@ const PAGE_SUBS = {
   history: "按模型查看历史可用性与平均倍率",
   upstreams: "管理各模型池的上游轨道",
   logs: "请求明细与费用耗时",
-  errors: "失败尝试与自动切换记录（保留 24 小时）",
+  errors: "失败请求与上游记录（保留 24 小时）",
   settings: "模型切换 / 价格 / NewAPI 探测 / 公网调用",
 };
 const SUB_ROUTES = { model: "model", pricing: "pricing", newapi: "newapi", public: "public" };

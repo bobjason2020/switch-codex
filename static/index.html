@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Switch-codex · Codex 调度站</title>
-  <link rel="stylesheet" href="/static/css/switchyard.css?v=20260812f" />
+  <link rel="stylesheet" href="/static/css/switchyard.css?v=20260823a" />
 </head>
 <body>
   <div class="app-shell">
@@ -163,7 +163,7 @@
           </table>
         </div>
         <p class="muted" style="margin-top:10px;font-size:0.8rem">
-          数字越小越优先。只在「使用模型」同池的启用上游中 failover。
+          数字越小越优先。纯透传：请求只按模型池选定第一个可用上游直连，失败如实返回、不自动切换。
           状态：<span class="pill disabled">停用</span>
           <span class="pill error">错误</span>
           <span class="pill ok">正常</span>
@@ -263,8 +263,8 @@
       <div class="card">
         <h2>错误日志（保留 24 小时，含完整请求体）</h2>
         <p class="hint">
-          每次向上游请求失败都会记录：最终状态、每个上游的尝试结果（是否触发自动切换）、
-          以及完整请求体。超过 24 小时的记录会自动清理。
+          纯透传下每个失败请求都会如实记录：最终状态、选定的上游、错误信息，以及完整请求体。
+          不做自动切换，失败即原样返回给客户端。超过 24 小时的记录会自动清理。
         </p>
         <div class="log-toolbar">
           <div>
@@ -315,7 +315,7 @@
                 <th>池</th>
                 <th>客户端模型</th>
                 <th>状态</th>
-                <th>尝试的上游</th>
+                <th>上游</th>
                 <th>错误信息</th>
                 <th>请求体</th>
                 <th>用时</th>
@@ -378,7 +378,8 @@
             <button class="btn" id="btnApplyClaude" type="button">应用</button>
           </div>
           <p class="hint" style="margin-top:8px">
-            openai / deepseek 走 4100（deepseek 含 flash / pro，/model 切换）。本机原配置可恢复，应用后新开会话。
+            纯透传模式下 <code>/v1/messages</code> 只支持声明「支持 Anthropic 原生 /messages」的上游；
+            若所选池无此类上游，Claude Code 请求会返回 503。本机原配置可恢复，应用后新开会话。
           </p>
           <div class="codex-sync-status">
             <span class="pill" id="claudeModePill">—</span>
@@ -705,21 +706,14 @@
           启用
         </label>
         <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
-          <input id="chatCompletions" type="checkbox" style="width:auto;margin:0" />
-          走 chat/completions（转换，默认关闭）
-        </label>
-        <p class="hint" style="margin-top:-8px">
-          仅当上游没有可用的 <code>/v1/responses</code> 端点时开启：请求会转换为
-          <code>chat/completions</code> 发出并转回 responses 格式返回。
-        </p>
-        <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
           <input id="anthropicMessages" type="checkbox" style="width:auto;margin:0" />
           支持 Anthropic 原生 /messages（Claude Code 透传，默认关闭）
         </label>
         <p class="hint" style="margin-top:-8px">
           开启后 Claude Code 请求（<code>/v1/messages</code>）会以 Anthropic 格式直接透传该上游
-          <code>{base_url}/messages</code>（<code>x-api-key</code> 认证），零转换、thinking/工具无损；
-          未开启的上游仍走 Responses 转换层。适用于原生提供 Anthropic 接口的上游。
+          <code>{base_url}/messages</code>（<code>x-api-key</code> 认证），零转换、thinking/工具无损。
+          纯透传模式下 <code>/v1/messages</code> 只支持声明了此选项的上游；未开启的上游不参与
+          <code>/v1/messages</code> 路由（会返回 503 提示）。适用于原生提供 Anthropic 接口的上游。
         </p>
         <div class="row">
           <div>
@@ -825,11 +819,11 @@
   </div>
 
 
-  <script src="/static/js/core.js?v=20260812g"></script>
-  <script src="/static/js/router.js?v=20260812f"></script>
-  <script src="/static/js/forms.js?v=20260817a"></script>
-  <script src="/static/js/overview.js?v=20260812e"></script>
-  <script src="/static/js/pages.js?v=20260812f"></script>
-  <script src="/static/js/app.js?v=20260812e"></script>
+  <script src="/static/js/core.js?v=20260823a"></script>
+  <script src="/static/js/router.js?v=20260823a"></script>
+  <script src="/static/js/forms.js?v=20260823a"></script>
+  <script src="/static/js/overview.js?v=20260823a"></script>
+  <script src="/static/js/pages.js?v=20260823a"></script>
+  <script src="/static/js/app.js?v=20260823a"></script>
 </body>
 </html>
