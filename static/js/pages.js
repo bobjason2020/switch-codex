@@ -486,13 +486,24 @@
       const models = [...new Set([...(pricingModels || []), ...Object.keys(pricing)])];
       $("pricingRows").innerHTML = models.map((m) => {
         const p = pricing[m] || {};
+        const lc = p.long_context || {};
         const val = (k) => (p[k] == null ? "" : p[k]);
+        const lval = (k) => (lc[k] == null ? "" : lc[k]);
         return `
           <div class="pricing-row" data-model="${escapeHtml(m)}">
             <div class="pool-name"><span class="pill model">${escapeHtml(m)}</span></div>
-            <div><label>输入（缓存未命中）</label><input data-k="input_per_m" type="number" step="0.001" min="0" value="${escapeHtml(val("input_per_m"))}" placeholder="0.28" /></div>
-            <div><label>缓存读</label><input data-k="cache_read_per_m" type="number" step="0.001" min="0" value="${escapeHtml(val("cache_read_per_m"))}" placeholder="0.07" /></div>
-            <div><label>输出</label><input data-k="output_per_m" type="number" step="0.001" min="0" value="${escapeHtml(val("output_per_m"))}" placeholder="1.10" /></div>
+            <div><label>输入（缓存未命中）</label><input data-k="input_per_m" type="number" step="0.001" min="0" value="${escapeHtml(val("input_per_m"))}" placeholder="5.0" /></div>
+            <div><label>缓存读</label><input data-k="cache_read_per_m" type="number" step="0.001" min="0" value="${escapeHtml(val("cache_read_per_m"))}" placeholder="0.5" /></div>
+            <div><label>缓存写入</label><input data-k="cache_creation_per_m" type="number" step="0.001" min="0" value="${escapeHtml(val("cache_creation_per_m"))}" placeholder="6.25" /></div>
+            <div><label>输出</label><input data-k="output_per_m" type="number" step="0.001" min="0" value="${escapeHtml(val("output_per_m"))}" placeholder="30.0" /></div>
+            <div class="pricing-lc">
+              <div class="lc-title">长文本档 — 输入上下文超过阈值后按下面单价计费（阈值留空 = 该模型不分档）</div>
+              <div><label>阈值 tokens</label><input data-k="lc.threshold" type="number" step="1" min="1" value="${escapeHtml(lval("threshold"))}" placeholder="272000" /></div>
+              <div><label>长文本 输入</label><input data-k="lc.input_per_m" type="number" step="0.001" min="0" value="${escapeHtml(lval("input_per_m"))}" placeholder="10.0" /></div>
+              <div><label>长文本 缓存读</label><input data-k="lc.cache_read_per_m" type="number" step="0.001" min="0" value="${escapeHtml(lval("cache_read_per_m"))}" placeholder="1.0" /></div>
+              <div><label>长文本 缓存写</label><input data-k="lc.cache_creation_per_m" type="number" step="0.001" min="0" value="${escapeHtml(lval("cache_creation_per_m"))}" placeholder="12.5" /></div>
+              <div><label>长文本 输出</label><input data-k="lc.output_per_m" type="number" step="0.001" min="0" value="${escapeHtml(lval("output_per_m"))}" placeholder="45.0" /></div>
+            </div>
           </div>`;
       }).join("");
     }

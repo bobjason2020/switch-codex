@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Switch-codex · Codex 调度站</title>
-  <link rel="stylesheet" href="/static/css/switchyard.css?v=20260823a" />
+  <link rel="stylesheet" href="/static/css/switchyard.css?v=20260825a" />
 </head>
 <body>
   <div class="app-shell">
@@ -419,8 +419,9 @@
         <div class="card">
           <h2>费用单价（USD / 1M tokens）</h2>
           <p class="hint">
-            用于计算请求日志的「费用」列：输入（缓存未命中）× 输入单价 + 缓存读 × 缓存单价 +
-            输出 × 输出单价。留空表示该模型暂不计算费用（不显示费用）。修改后对历史日志同样生效。
+            用于计算请求日志的「费用」列：输入（缓存未命中）× 输入单价 + 缓存读 × 缓存单价 + 缓存写入 × 缓存写入单价 + 输出 × 输出单价。
+            可选「长文本档」：输入上下文超过阈值后改用该档的具体单价计费（阈值留空 = 该模型不分档）。
+            单价留空表示该模型暂不计算费用（不显示费用）。修改后对历史日志同样生效。
           </p>
           <div id="pricingRows"></div>
           <div class="actions">
@@ -819,11 +820,11 @@
   </div>
 
 
-  <script src="/static/js/core.js?v=20260823a"></script>
-  <script src="/static/js/router.js?v=20260823a"></script>
-  <script src="/static/js/forms.js?v=20260823a"></script>
-  <script src="/static/js/overview.js?v=20260823a"></script>
-  <script src="/static/js/pages.js?v=20260823a"></script>
-  <script src="/static/js/app.js?v=20260823a"></script>
+  <script src="/static/js/core.js?v=20260825a"></script>
+  <script src="/static/js/router.js?v=20260825a"></script>
+  <script src="/static/js/forms.js?v=20260825a"></script>
+  <script src="/static/js/overview.js?v=20260825a"></script>
+  <script src="/static/js/pages.js?v=20260825a"></script>
+  <script src="/static/js/app.js?v=20260825a"></script>
 </body>
 </html>

@@ -154,7 +154,7 @@ class ModelProbeRunIn(BaseModel):
 
 
 class PricingIn(BaseModel):
-    pricing: dict[str, dict[str, Optional[float]]]
+    pricing: dict[str, dict[str, Any]]
 
 
 class PublicAccessIn(BaseModel):
@@ -792,12 +792,23 @@ async def set_pricing(body: PricingIn, _: str = Depends(auth.require_master)):
     cleaned: dict[str, dict[str, float]] = {}
     for pool, vals in body.pricing.items():
         d: dict[str, float] = {}
-        for k in ("input_per_m", "output_per_m", "cache_read_per_m"):
+        for k in core.PRICE_KEYS:
             v = vals.get(k)
             if v is not None:
                 f = core._float_or_none(v)
                 if f is not None:
                     d[k] = f
+        lc_raw = vals.get("long_context")
+        if isinstance(lc_raw, dict):
+            lc: dict[str, float] = {}
+            for k in ("threshold",) + core.PRICE_KEYS:
+                v = lc_raw.get(k)
+                if v is not None:
+                    f = core._float_or_none(v)
+                    if f is not None:
+                        lc[k] = f
+            if lc:
+                d["long_context"] = lc
         if d:
             cleaned[str(pool).strip()] = d
     core.save_pricing(cleaned)

@@ -760,14 +760,56 @@ def save_pricing(pricing: dict) -> None:
     save_config(cfg)
 
 
+PRICE_KEYS = ("input_per_m", "output_per_m", "cache_read_per_m", "cache_creation_per_m")
+# 长文本档阈值官方默认值：输入上下文超过该值按 long_context 具体单价计费
+DEFAULT_LONG_CONTEXT_THRESHOLD = 272000
+
+
+def _parse_long_context(raw: Any) -> Optional[dict]:
+    """解析模型配置里可选的长文本档 long_context 子对象（具体单价，非倍率）。
+
+    未配置返回 None；配置了返回 {threshold, 4 个单价键}，缺失的单价键为 None
+    （计算时回退到基础价），threshold 缺省 272000。只有阈值没有价格时视为未配置。
+    """
+    if not isinstance(raw, dict):
+        return None
+    if not any(k in raw for k in ("threshold",) + PRICE_KEYS):
+        return None
+    threshold = _float_or_none(raw.get("threshold"))
+    if threshold is None:
+        threshold = float(DEFAULT_LONG_CONTEXT_THRESHOLD)
+    prices = {k: _float_or_none(raw.get(k)) for k in PRICE_KEYS}
+    if not any(v is not None for v in prices.values()):
+        return None
+    return {"threshold": threshold, **prices}
+
+
+def _is_long_context(pr: dict, input_tokens: Optional[int]) -> bool:
+    lc = pr.get("long_context")
+    return (
+        isinstance(lc, dict)
+        and lc.get("threshold") is not None
+        and input_tokens is not None
+        and int(input_tokens) > lc["threshold"]
+    )
+
+
+def _effective_prices(pr: dict, input_tokens: Optional[int]) -> dict:
+    """按输入上下文长度选出本条日志实际生效的单价。
+
+    未配置 long_context 或输入未超阈值时返回基础单价；超阈值时返回
+    long_context 里配置的具体单价，缺失键回退基础价。
+    """
+    if not _is_long_context(pr, input_tokens):
+        return {k: pr.get(k) for k in PRICE_KEYS}
+    lc = pr["long_context"]
+    return {k: lc.get(k) if lc.get(k) is not None else pr.get(k) for k in PRICE_KEYS}
+
+
 def pricing_for(pool: str, client_model: Optional[str] = None) -> dict:
-    empty = {
-        "input_per_m": None,
-        "output_per_m": None,
-        "cache_read_per_m": None,
-        "cache_creation_per_m": None,
-    }
+    empty = {k: None for k in PRICE_KEYS}
     fallback = dict(empty)
+    fallback_lc: Optional[dict] = None
     seen: set[str] = set()
     for key in (client_model, pool):
         key = str(key or "").strip()
@@ -777,17 +819,14 @@ def pricing_for(pool: str, client_model: Optional[str] = None) -> dict:
         raw = load_pricing().get(key)
         if not isinstance(raw, dict):
             continue
-        current = {
-            "input_per_m": _float_or_none(raw.get("input_per_m")),
-            "output_per_m": _float_or_none(raw.get("output_per_m")),
-            "cache_read_per_m": _float_or_none(raw.get("cache_read_per_m")),
-            "cache_creation_per_m": _float_or_none(raw.get("cache_creation_per_m")),
-        }
+        current = {k: _float_or_none(raw.get(k)) for k in PRICE_KEYS}
+        current_lc = _parse_long_context(raw.get("long_context"))
         if current["input_per_m"] is not None and current["output_per_m"] is not None:
-            return current
+            return {**current, "long_context": current_lc}
         if fallback == empty:
             fallback = current
-    return fallback
+            fallback_lc = current_lc
+    return {**fallback, "long_context": fallback_lc}
 
 
 def compute_cost_usd(entry: dict) -> Optional[float]:
@@ -795,7 +834,10 @@ def compute_cost_usd(entry: dict) -> Optional[float]:
     output_tokens = entry.get("output_tokens")
     if input_tokens is None and output_tokens is None:
         return None
-    pr = pricing_for(entry.get("pool") or "", entry.get("client_model"))
+    pr = _effective_prices(
+        pricing_for(entry.get("pool") or "", entry.get("client_model")),
+        entry.get("input_tokens"),
+    )
     inp = pr["input_per_m"]
     out = pr["output_per_m"]
     if inp is None or out is None:
@@ -853,7 +895,8 @@ def cost_breakdown(entry: dict) -> Optional[dict]:
     output_tokens = entry.get("output_tokens")
     if input_tokens is None and output_tokens is None:
         return None
-    pr = pricing_for(entry.get("pool") or "", entry.get("client_model"))
+    base_pr = pricing_for(entry.get("pool") or "", entry.get("client_model"))
+    pr = _effective_prices(base_pr, entry.get("input_tokens"))
     inp = pr["input_per_m"]
     out = pr["output_per_m"]
     if inp is None or out is None:
@@ -904,6 +947,8 @@ def cost_breakdown(entry: dict) -> Optional[dict]:
         "total": total,
         "multiplier": mult,
         "real_cost_cny": real,
+        "tier": "long_context" if _is_long_context(base_pr, entry.get("input_tokens")) else "standard",
+        "long_context_threshold": (base_pr.get("long_context") or {}).get("threshold"),
     }
 
 

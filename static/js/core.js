@@ -176,6 +176,9 @@
       ].filter(Boolean).join(" · ");
       $("feeDetail").innerHTML = `
         <div class="fee-meta">${feeMeta}</div>
+        ${b.tier === "long_context" && b.long_context_threshold != null
+          ? `<div class="fee-tier">长文本档（输入上下文 > ${fmtTok(b.long_context_threshold)}）</div>`
+          : ""}
         <table class="fee-table">
           <thead>
             <tr><th>项目</th><th>单价</th><th>单项总价</th></tr>

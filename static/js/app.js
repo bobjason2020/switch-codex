@@ -157,10 +157,17 @@
       document.querySelectorAll("#pricingRows [data-model]").forEach((row) => {
         const m = row.dataset.model;
         const p = {};
+        const lc = {};
         row.querySelectorAll("input[data-k]").forEach((inp) => {
           const v = inp.value.trim();
-          if (v !== "") p[inp.dataset.k] = Number(v);
+          if (v === "") return;
+          const key = inp.dataset.k;
+          if (key.startsWith("lc.")) lc[key.slice(3)] = Number(v);
+          else p[key] = Number(v);
         });
+        // 长文本档：阈值 + 至少一个长文本单价都填了才提交（阈值留空 = 不分档）
+        const lcPrices = Object.keys(lc).filter((k) => k !== "threshold");
+        if (lc.threshold != null && lcPrices.length) p.long_context = lc;
         if (Object.keys(p).length) out[m] = p;
       });
       try {

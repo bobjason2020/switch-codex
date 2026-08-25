@@ -680,10 +680,14 @@ code { font-size: 0.85em; padding: 1px 5px; border-radius: 5px; background: rgba
 .log-footer .pager .page-jump { width: 64px; padding: 6px 8px; margin: 0; font-size: 0.8rem; text-align: center; border-radius: 6px; }
 
 /* ---------- 费用 ---------- */
-.pricing-row { display: grid; grid-template-columns: 1.3fr 1fr 1fr 1fr; gap: 10px; align-items: end; margin-bottom: 12px; }
+.pricing-row { display: grid; grid-template-columns: 1.3fr 1fr 1fr 1fr 1fr; gap: 10px; align-items: end; margin-bottom: 12px; }
 @media (max-width: 720px) { .pricing-row { grid-template-columns: 1fr 1fr; } }
 .pricing-row .pool-name { display: flex; align-items: center; padding-bottom: 10px; }
 .pricing-row input { margin-bottom: 0; }
+.pricing-lc { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr 1fr 1fr 1fr; gap: 10px; align-items: end; padding: 12px; background: rgba(127, 127, 127, 0.06); border: 1px dashed rgba(127, 127, 127, 0.35); border-radius: 8px; }
+@media (max-width: 720px) { .pricing-lc { grid-template-columns: 1fr 1fr; } }
+.pricing-lc .lc-title { grid-column: 1 / -1; font-size: 0.78rem; color: var(--muted, #888); padding-bottom: 2px; }
+.pricing-lc input { margin-bottom: 0; }
 
 /* ---------- 模态框 ---------- */
 .modal-mask {
@@ -750,6 +754,7 @@ code { font-size: 0.85em; padding: 1px 5px; border-radius: 5px; background: rgba
 .failover-no { color: var(--danger); }
 
 .fee-meta { margin-bottom: 12px; font-size: 0.82rem; color: var(--muted); }
+.fee-tier { margin: 0 0 8px; font-size: 0.78rem; color: #b45309; }
 .fee-table { width: 100%; }
 .fee-table th, .fee-table td { padding: 8px 10px; }
 .fee-table td:first-child { white-space: nowrap; }
