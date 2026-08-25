@@ -1,33 +1,29 @@
-"""Switch-codex 代理层：/v1/responses 多上游透传、failover 与重级联。"""
+"""Switch-codex 代理层：/v1/responses、/v1/alpha/search、/v1/messages 纯透传。
+
+纯透传语义：
+- 不做任何协议转换（去掉 Responses↔Chat、Anthropic↔Responses）。
+- 不做多上游 failover：请求只按模型池选定的一个上游直连，失败如实返回。
+- 不做 model 重写：客户端模型名原样透传，不改写 body。
+- 不深度解析 SSE 改写字节流；仅旁路读取 usage 用于日志/统计。
+"""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import re
 import time
-from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Optional
+from typing import Any, AsyncIterator, Mapping, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from sy import anthropic, auth, convert, core, logbook, probes, timeutil
-from sy.const import (
-    CAPACITY_HINTS,
-    ERROR_LOG_ATTEMPT_BODY_MAX,
-    FAILOVER_STATUS,
-    PREFERRED_RETRY_BASE_DELAY_SEC,
-    PREFERRED_RETRY_COUNT,
-    STREAM_PREOUTPUT_RETRY_COUNT,
-    STREAM_RETRY_BASE_DELAY_SEC,
-)
+from sy import auth, core, logbook, probes, timeutil
+from sy.const import ERROR_LOG_ATTEMPT_BODY_MAX
 
 log = logging.getLogger("switchyard.proxy")
-_iso_now = timeutil.iso_now
-
 router = APIRouter()
-
+_iso_now = timeutil.iso_now
 
 # These headers describe the client-to-proxy connection or carry credentials
 # that must be replaced for the selected upstream.  Everything else is kept so
@@ -103,74 +99,27 @@ def _upstream_response_headers(
     return out
 
 
-def _is_capacity_error(text: Optional[str]) -> bool:
-    """Detect upstream "model at capacity" style errors regardless of HTTP status."""
-    lower = (text or "").lower()
-    return any(hint in lower for hint in CAPACITY_HINTS)
-
-
-def _is_preferred_retryable(status_code: Optional[int], capacity_error: bool) -> bool:
-    """首选渠道失败后是否值得在同一渠道上重试。
-
-    连接错误（status_code=None）和瞬态 5xx/容量错误可以重试；
-    401/403 属于凭证问题，重试不会好转。
-    """
-    if status_code is None:
-        return True
-    if status_code in (401, 403):
-        return False
-    return bool(capacity_error) or status_code in FAILOVER_STATUS or status_code >= 500
-
-
-async def _preferred_retry_sleep(retry_no: int) -> None:
-    """首选渠道重试间的线性退避：第 1 次 0.5s，第 2 次 1.0s，封顶 2s。"""
-    await asyncio.sleep(min(PREFERRED_RETRY_BASE_DELAY_SEC * retry_no, 2.0))
-
-
 def _header_safe(value: Any) -> str:
-    s = str(value or "")
-    try:
-        s.encode("latin-1")
-        return s
-    except UnicodeEncodeError:
-        return s.encode("ascii", errors="replace").decode("ascii")
+    return str(value or "").replace("\r", " ").replace("\n", " ")[:512]
 
 
 def _caller_ip(request: Request, trust_proxy_headers: bool = False) -> str:
-    """Return the effective client IP.
-
-    Cloudflare 经 loopback 进来时始终采用 cf-connecting-ip；
-    其它代理头仅在 ``trust_proxy_headers`` 打开时采信。
-    """
-    peer = request.client.host if request.client else ""
-    cf = (request.headers.get("cf-connecting-ip") or "").strip()
-    if cf and (trust_proxy_headers or core.is_loopback_ip(peer)):
-        return cf.split(",")[0].strip()
     if trust_proxy_headers:
-        xff = (request.headers.get("x-forwarded-for") or "").strip()
-        if xff:
-            parts = [p.strip() for p in xff.split(",") if p.strip()]
-            if parts:
-                return parts[0]
-    return peer
+        for h in ("x-forwarded-for", "cf-connecting-ip", "x-real-ip"):
+            raw = request.headers.get(h)
+            if raw:
+                return raw.split(",")[0].strip()
+    return request.client.host if request.client else ""
 
 
 def _is_public_request(request: Request, trust_proxy_headers: bool = False) -> bool:
-    """非回环对端、或 loopback+cf-connecting-ip（cloudflared）视为公网。"""
-    peer = request.client.host if request.client else ""
-    cf = (request.headers.get("cf-connecting-ip") or "").strip()
-    if cf and core.is_loopback_ip(peer):
-        return True
-    if peer and not core.is_loopback_ip(peer):
-        return True
-    if trust_proxy_headers:
-        return bool(
-            cf or (request.headers.get("x-forwarded-for") or "").strip()
-        )
-    return False
+    ip = _caller_ip(request, trust_proxy_headers)
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        return False
+    return True
 
 
-_SAFE_PATH_SEG = re.compile(r"^[A-Za-z0-9_.-]+$")
+_SAFE_PATH_SEG = __import__("re").compile(r"^[A-Za-z0-9._~-]+$")
 
 
 def _safe_responses_path(path: str, method: str) -> str:
@@ -217,6 +166,8 @@ class _SseLineBuffer:
 
 
 class _UsageSink:
+    """只读旁路：从透传流中提取 usage，不改写任何字节。"""
+
     def __init__(self) -> None:
         self.usage: Optional[dict] = None
 
@@ -263,83 +214,6 @@ async def _aclose_quietly(*objs: Any) -> None:
             pass
 
 
-class _IncompleteStreamError(RuntimeError):
-    """Raised when an upstream stream ends without a terminal event."""
-
-
-async def _stream_with_preoutput_retry(
-    initial_response: httpx.Response,
-    open_retry: Callable[[], Awaitable[httpx.Response]],
-    state: dict[str, Any],
-    consume_attempt: Callable[[httpx.Response], AsyncIterator[bytes]],
-    attempt_complete: Callable[[], bool],
-    label: str,
-) -> AsyncIterator[bytes]:
-    """Retry a stream only while no downstream bytes have been emitted.
-
-    ``consume_attempt`` owns protocol parsing and yields bytes destined for the
-    client.  The helper can therefore distinguish a safe pre-output failure
-    from a partial response that must be left to the client's reconnect logic.
-    """
-    response = initial_response
-    state["response"] = response
-    retry_no = 0
-    while True:
-        try:
-            async for output in consume_attempt(response):
-                if output:
-                    state["downstream_started"] = True
-                    yield output
-            if not attempt_complete():
-                raise _IncompleteStreamError("stream ended before completion")
-            return
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            if state.get("downstream_started") or retry_no >= STREAM_PREOUTPUT_RETRY_COUNT:
-                raise
-            await _aclose_quietly(response)
-            retry_no += 1
-            state["stream_retries"] = retry_no
-            log.warning(
-                "upstream=%s %s before downstream output: %s "
-                "(stream retry %d/%d)",
-                state.get("upstream") or "?",
-                label,
-                exc,
-                retry_no,
-                STREAM_PREOUTPUT_RETRY_COUNT,
-            )
-            await asyncio.sleep(
-                min(STREAM_RETRY_BASE_DELAY_SEC * retry_no, 2.0)
-            )
-            response = await open_retry()
-            state["response"] = response
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"stream retry returned HTTP {response.status_code}"
-                )
-
-
-def _responses_stream_terminal_line(line: str) -> bool:
-    text = line.strip()
-    if not text.startswith("data:"):
-        return False
-    data = text[5:].strip()
-    if data == "[DONE]":
-        return True
-    if not data.startswith("{"):
-        return False
-    try:
-        obj = json.loads(data)
-    except Exception:
-        return False
-    return isinstance(obj, dict) and obj.get("type") in {
-        "response.completed",
-        "response.failed",
-    }
-
-
 def _live_ok_payload(
     client_model: str, route_pool: str, upstream: dict, status_code: int
 ) -> dict:
@@ -362,119 +236,48 @@ def _live_ok_payload(
     }
 
 
-async def _kick_recascade(
-    client_model: Optional[str],
-    failed_ids: set[str],
-    timeout: float,
-) -> None:
-    if not client_model:
-        return
-
-    async def _run() -> None:
-        try:
-            await probes._cascade_probe_model(
-                str(client_model),
-                timeout=min(timeout, 30.0),
-                record_log=True,
-                exclude_ids=set(failed_ids),
-            )
-        except Exception:
-            log.exception("background re-cascade failed model=%s", client_model)
-
-    try:
-        asyncio.create_task(_run())
-    except Exception:
-        log.exception("schedule re-cascade failed model=%s", client_model)
-
-
 def _build_upstream_url(base_url: str, path_suffix: str) -> str:
     base = base_url.rstrip("/")
     suf = path_suffix.lstrip("/")
     return f"{base}/{suf}"
 
 
-def _rewrite_request_model(raw: bytes, request_model: Optional[str]) -> bytes:
-    """Rewrite body.model to the upstream's configured request model.
-
-    Returns the original bytes when there is nothing to change (or the body is
-    not parseable JSON), so tolerant upstreams keep the exact payload.
-    """
-    if not raw or not request_model:
-        return raw
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return raw
-    if not isinstance(data, dict) or not isinstance(data.get("model"), str):
-        return raw
-    current = data["model"].strip()
-    if not current or current == request_model:
-        return raw
-    data["model"] = request_model
-    try:
-        return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    except Exception:
-        return raw
-
-
 async def _forward_once(
     client: httpx.AsyncClient,
     upstream: dict,
-    method: str,
     path_suffix: str,
     body: bytes,
     content_type: str,
     extra_headers: Mapping[str, str],
-    client_model: Optional[str] = None,
-    passthrough: bool = False,
+    *,
+    anthropic: bool = False,
 ) -> httpx.Response:
-    if passthrough:
-        # Anthropic 原生透传：body 已是 Anthropic Messages 格式，直接发上游 {base}/messages。
-        url = _build_upstream_url(upstream["base_url"], "messages")
-        request_model = None
-    else:
-        # Standalone search has its own OpenAI endpoint and must remain a
-        # Responses-native payload; converting it to Chat Completions breaks
-        # Codex's search protocol.
-        chat_mode = bool(upstream.get("chat_completions")) and path_suffix != "alpha/search"
-        if chat_mode:
-            path_suffix = "chat/completions"
-            try:
-                body = json.dumps(
-                    convert.responses_body_to_chat(json.loads(body)),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            except Exception as e:
-                raise ValueError(f"responses→chat conversion failed: {e}") from e
-        url = _build_upstream_url(upstream["base_url"], path_suffix)
-        request_model = core.upstream_request_model(upstream, client_model)
-        body = _rewrite_request_model(body, request_model)
+    """单上游纯透传：body 原样、模型名不改写、无协议转换。
+
+    ``anthropic=True`` 用于 /v1/messages（Anthropic Messages 原生），用
+    x-api-key 认证；否则 /v1/responses 与 /v1/alpha/search 用 Bearer。
+    """
+    url = _build_upstream_url(upstream["base_url"], path_suffix)
     headers = _forward_request_headers(extra_headers)
     headers["content-type"] = content_type or headers.get(
         "content-type", "application/json"
     )
-    if passthrough:
-        # Anthropic 原生端点用 x-api-key 认证（与 Anthropic 官方一致）
+    if anthropic:
+        # Anthropic 原生端点用 x-api-key 认证（与 Anthropic 官方一致）。
         headers["x-api-key"] = upstream["api_key"]
-        # anthropic-version：客户端有则透传，缺失补默认值（借鉴 cc-switch forwarder）
         headers["anthropic-version"] = (
             headers.get("anthropic-version") or "2023-06-01"
         )
-        if headers.get("anthropic-beta"):
-            headers["anthropic-beta"] = headers["anthropic-beta"]
     else:
         headers["Authorization"] = f"Bearer {upstream['api_key']}"
     log.info(
-        "try upstream=%s pool=%s request_model=%s priority=%s %s %s",
+        "try upstream=%s pool=%s %s %s",
         upstream.get("name"),
         core.normalize_model(upstream.get("model")),
-        request_model,
-        upstream.get("priority"),
-        method,
+        "POST",
         url,
     )
-    req = client.build_request(method, url, content=body, headers=headers)
+    req = client.build_request("POST", url, content=body, headers=headers)
     return await client.send(req, stream=True)
 
 
@@ -486,6 +289,11 @@ async def proxy_responses(
     path: str = "",
     _: str = Depends(auth.require_client_key),
 ):
+    """纯透传 /v1/responses 与 /v1/alpha/search。
+
+    按模型池选定一个上游直连（保留按倍率/可用性缓存排序，但不 failover），
+    失败如实返回。流式响应逐块透传并旁路提取 usage。
+    """
     cfg = core.load_config()
     timeout = float(cfg.get("timeout_sec", 120))
     active = core.normalize_model(cfg.get("active_model"))
@@ -502,9 +310,13 @@ async def proxy_responses(
     method = request.method.upper()
     standalone_search = request.url.path == "/v1/alpha/search"
     path_suffix = "alpha/search" if standalone_search else _safe_responses_path(path, method)
-    log_path = "/v1/alpha/search" if standalone_search else (f"/v1/responses/{path}" if path else "/v1/responses")
+    log_path = (
+        "/v1/alpha/search"
+        if standalone_search
+        else (f"/v1/responses/{path}" if path else "/v1/responses")
+    )
 
-    # client model + stream + reasoning effort if present (passthrough — no rewrite)
+    # client model + stream（仅用于日志/路由；body 原样透传，不改写）
     client_model = None
     stream = False
     reasoning_effort = None
@@ -534,11 +346,6 @@ async def proxy_responses(
         ttft_ms: Optional[float] = None,
         endpoint: Optional[str] = None,
         upstream_id: Optional[str] = None,
-        stream_completed: Optional[bool] = None,
-        stream_error: Optional[str] = None,
-        client_disconnect: Optional[bool] = None,
-        downstream_started: Optional[bool] = None,
-        stream_retries: Optional[int] = None,
     ) -> None:
         logbook._record_log(
             client_ip=client_ip,
@@ -563,11 +370,6 @@ async def proxy_responses(
             error_log_id=error_log_id,
             attempts=attempts,
             stream=stream,
-            stream_completed=stream_completed,
-            stream_error=stream_error,
-            client_disconnect=client_disconnect,
-            downstream_started=downstream_started,
-            stream_retries=stream_retries,
             **logbook._usage_numbers(usage),
         )
 
@@ -608,19 +410,18 @@ async def proxy_responses(
             record(status=403, error_log_id=eid)
             raise HTTPException(status_code=403, detail="IP not allowed")
 
-    # Route by client model availability when possible:
-    # 1) prefer last cascade winner for this client_model
-    # 2) then low→high multiplier within the model's pool
-    # 3) on preferred failure → retry the same channel (transient errors only),
-    #    then re-cascade probe (excluding failed ids) and continue
+    # 按模型池选定上游：取排序后第一个（倍率低→高，可用性缓存优先）。
+    # 纯透传不做 failover——失败如实返回，不再切到其它上游重发。
+    # /v1/responses 只接受 Responses 原生上游；chat_completions 上游因无转换层
+    # 无法承接 Responses 协议，予以排除。
     route_pool = core.resolve_route_pool(client_model, active)
-    failed_ids: set[str] = set()
-    cascaded_once = False
     candidates = core.order_candidates_for_model(client_model, route_pool)
     if standalone_search:
         candidates = [
             u for u in candidates if core.upstream_supports_standalone_web_search(u)
         ]
+    else:
+        candidates = [u for u in candidates if not u.get("chat_completions")]
     if not candidates:
         # Fall back to active pool if client model maps to an empty pool.
         route_pool = active
@@ -629,6 +430,8 @@ async def proxy_responses(
             candidates = [
                 u for u in candidates if core.upstream_supports_standalone_web_search(u)
             ]
+        else:
+            candidates = [u for u in candidates if not u.get("chat_completions")]
     if not candidates:
         eid = record_error(status=503, error="no enabled upstreams for route pool")
         record(status=503, error_log_id=eid)
@@ -641,642 +444,224 @@ async def proxy_responses(
             ),
         )
 
-    prefer_name = candidates[0].get("name") if candidates else None
+    upstream = candidates[0]
+    umodel = core.normalize_model(upstream.get("model"))
     log.info(
-        "proxy active_pool=%s route_pool=%s client_model=%s prefer=%s candidates=%s",
+        "proxy active_pool=%s route_pool=%s client_model=%s upstream=%s",
         active,
         route_pool,
         client_model,
-        prefer_name,
-        [u.get("name") for u in candidates],
+        upstream.get("name"),
     )
 
     errors: list[dict] = []
     client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
-    idx = 0
-    auth_failovers = 0
-    preferred_retries_left = PREFERRED_RETRY_COUNT
-
     try:
-        while idx < len(candidates):
-            upstream = candidates[idx]
-            uid = str(upstream.get("id") or "")
-            umodel = core.normalize_model(upstream.get("model"))
-            is_preferred = bool(
-                not cascaded_once
-                and client_model
-                and prefer_name
-                and upstream.get("name") == prefer_name
-            )
-            try:
-                resp = await _forward_once(
-                    client,
-                    upstream,
-                    method,
-                    path_suffix,
-                    body,
-                    content_type,
-                    extra,
-                    client_model,
-                )
-            except Exception as e:
-                retryable = is_preferred and _is_preferred_retryable(None, False)
-                if retryable and preferred_retries_left > 0:
-                    preferred_retries_left -= 1
-                    retry_no = PREFERRED_RETRY_COUNT - preferred_retries_left
-                    log.warning(
-                        "upstream=%s connection error: %s "
-                        "(preferred retry %d/%d)",
-                        upstream.get("name"),
-                        e,
-                        retry_no,
-                        PREFERRED_RETRY_COUNT,
-                    )
-                    await _preferred_retry_sleep(retry_no)
-                    continue
-                log.warning("upstream=%s connection error: %s", upstream.get("name"), e)
-                if uid:
-                    failed_ids.add(uid)
-                probes.mark_model_upstream_failed(
-                    client_model, upstream, status=None, error=str(e)
-                )
-                attempt = {
-                    "upstream": upstream.get("name"),
-                    "pool": umodel,
-                    "priority": int(upstream.get("priority", 100)),
-                    "multiplier": core.upstream_multiplier_value(upstream),
-                    "status": None,
-                    "error": str(e),
-                    "failover": True,
-                }
-                if is_preferred:
-                    attempt["retries"] = PREFERRED_RETRY_COUNT - preferred_retries_left
-                errors.append(attempt)
-                if is_preferred:
-                    cascaded_once = True
-                    log.info(
-                        "re-cascade after connection fail model=%s exclude=%s",
-                        client_model,
-                        list(failed_ids),
-                    )
-                    await _kick_recascade(client_model, failed_ids, timeout)
-                    candidates = core.order_candidates_for_model(
-                        client_model, route_pool, exclude_ids=set(failed_ids)
-                    )
-                    prefer_name = candidates[0].get("name") if candidates else None
-                    idx = 0
-                else:
-                    idx += 1
-                continue
-
-            upstream_url = str(resp.request.url) if resp.request is not None else ""
-
-            if resp.status_code < 400:
-                log.info(
-                    "success upstream=%s pool=%s status=%s",
-                    upstream.get("name"),
-                    umodel,
-                    resp.status_code,
-                )
-                arrived_ms = (time.perf_counter() - t0) * 1000.0
-                convert_mode = bool(upstream.get("chat_completions"))
-                out_ct = resp.headers.get("content-type", "")
-
-                if convert_mode and "event-stream" in out_ct:
-                    # Chat SSE → Responses SSE 转换流。
-                    converter = convert.ChatSseToResponses()
-                    converter.model = client_model or upstream.get("model") or ""
-
-                    async def stream_body_convert(
-                        r=resp,
-                        c=client,
-                        up=upstream,
-                        uurl=upstream_url,
-                        conv=converter,
-                        arrived=arrived_ms,
-                    ):
-                        sink = _UsageSink()
-                        sse_buf = _SseLineBuffer()
-                        stream_error = None
-                        client_disconnect = False
-                        first_ms = None
-                        try:
-                            async for chunk in r.aiter_bytes():
-                                if first_ms is None:
-                                    first_ms = (time.perf_counter() - t0) * 1000.0
-                                if not chunk:
-                                    continue
-                                for line in sse_buf.feed(chunk):
-                                    stripped = line.strip()
-                                    if not stripped.startswith("data:"):
-                                        continue
-                                    data = stripped[5:].strip()
-                                    if data == "[DONE]":
-                                        events = conv.finalize()
-                                    elif data.startswith("{"):
-                                        try:
-                                            obj = json.loads(data)
-                                        except Exception:
-                                            continue
-                                        sink.feed_obj(obj)
-                                        events = conv.handle_chunk(obj)
-                                    else:
-                                        continue
-                                    for ev in events:
-                                        yield ev.encode("utf-8")
-                            leftover = sse_buf.flush()
-                            if leftover and leftover.strip().startswith("data:"):
-                                data = leftover.strip()[5:].strip()
-                                if data.startswith("{"):
-                                    try:
-                                        sink.feed_obj(json.loads(data))
-                                    except Exception:
-                                        pass
-                            if not conv.is_completed():
-                                for ev in conv.finalize():
-                                    yield ev.encode("utf-8")
-                        except asyncio.CancelledError:
-                            client_disconnect = True
-                            raise
-                        except Exception as e:
-                            stream_error = f"stream aborted: {e}"
-                            try:
-                                yield conv.failed_event(str(e), "stream_error").encode("utf-8")
-                            except Exception:
-                                pass
-                        finally:
-                            await _aclose_quietly(r, c)
-                            stream_err_log_id = None
-                            ok = not stream_error and conv.is_completed()
-                            if not client_disconnect and not ok:
-                                reason = stream_error or "stream ended without response.completed"
-                                stream_err_log_id = record_error(
-                                    status=r.status_code,
-                                    error=reason,
-                                    attempts=list(errors),
-                                )
-                            if ok and client_model:
-                                probes._set_model_availability(
-                                    str(client_model),
-                                    _live_ok_payload(
-                                        str(client_model), route_pool, up, r.status_code
-                                    ),
-                                )
-                            record(
-                                status=r.status_code,
-                                upstream=up.get("name"),
-                                url=uurl,
-                                multiplier=core.upstream_multiplier_value(up),
-                                error_log_id=stream_err_log_id,
-                                attempts=list(errors) if errors else None,
-                                usage=conv.latest_usage or sink.usage,
-                                duration_ms=(time.perf_counter() - t0) * 1000.0,
-                                ttft_ms=first_ms if first_ms is not None else arrived,
-                                endpoint="chat",
-                                upstream_id=up.get("id"),
-                            )
-
-                    out_headers = _stream_headers(
-                        _upstream_response_headers(
-                            resp,
-                            {
-                                "content-type": "text/event-stream",
-                                "x-switch-codex-upstream": _header_safe(
-                                    upstream.get("name", "")
-                                ),
-                                "x-switch-codex-pool": _header_safe(umodel),
-                                "x-switch-codex-route-pool": _header_safe(route_pool),
-                                "x-switch-codex-active-model": _header_safe(active),
-                            },
-                        )
-                    )
-                    if client_model is not None:
-                        out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
-                    return StreamingResponse(
-                        stream_body_convert(),
-                        status_code=200,
-                        headers=out_headers,
-                        media_type="text/event-stream",
-                    )
-
-                if convert_mode:
-                    # 非流式 Chat Completions 响应 → Responses 对象。
-                    raw = await resp.aread()
-                    await resp.aclose()
-                    try:
-                        chat_obj = json.loads(raw)
-                    except Exception:
-                        out_headers = {
-                            "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
-                            "x-switch-codex-pool": _header_safe(umodel),
-                            "x-switch-codex-route-pool": _header_safe(route_pool),
-                            "x-switch-codex-active-model": _header_safe(active),
-                        }
-                        await client.aclose()
-                        return Response(
-                            content=raw,
-                            status_code=502,
-                            media_type="application/json",
-                            headers=out_headers,
-                        )
-                    out = convert.chat_response_to_responses(chat_obj)
-                    out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8")
-                    usage = logbook._extract_usage(out_bytes)
-                    if client_model:
-                        probes._set_model_availability(
-                            str(client_model),
-                            _live_ok_payload(
-                                str(client_model), route_pool, upstream, 200
-                            ),
-                        )
-                    record(
-                        status=200,
-                        upstream=upstream.get("name"),
-                        url=upstream_url,
-                        multiplier=core.upstream_multiplier_value(upstream),
-                        attempts=list(errors) if errors else None,
-                        usage=usage,
-                        duration_ms=(time.perf_counter() - t0) * 1000.0,
-                        ttft_ms=arrived_ms,
-                        endpoint="chat",
-                        upstream_id=upstream.get("id"),
-                    )
-                    out_headers = {
-                        "content-type": "application/json",
-                        "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
-                        "x-switch-codex-pool": _header_safe(umodel),
-                        "x-switch-codex-route-pool": _header_safe(route_pool),
-                        "x-switch-codex-active-model": _header_safe(active),
-                    }
-                    if client_model is not None:
-                        out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
-                    await client.aclose()
-                    return Response(
-                        content=out_bytes,
-                        status_code=200,
-                        media_type="application/json",
-                        headers=out_headers,
-                    )
-
-                # Standalone search providers may return a complete JSON
-                # envelope (encrypted_output/output/results) instead of an
-                # SSE Responses stream. Preserve that envelope byte-for-byte;
-                # treating it as SSE makes a successful upstream response look
-                # like "stream ended before completion" to the client.
-                if standalone_search and "application/json" in resp.headers.get(
-                    "content-type", ""
-                ).lower():
-                    raw = await resp.aread()
-                    await resp.aclose()
-                    usage = logbook._extract_usage(raw)
-                    if client_model:
-                        probes._set_model_availability(
-                            str(client_model),
-                            _live_ok_payload(
-                                str(client_model), route_pool, upstream, resp.status_code
-                            ),
-                        )
-                    record(
-                        status=resp.status_code,
-                        upstream=upstream.get("name"),
-                        url=upstream_url,
-                        multiplier=core.upstream_multiplier_value(upstream),
-                        attempts=list(errors) if errors else None,
-                        usage=usage,
-                        duration_ms=(time.perf_counter() - t0) * 1000.0,
-                        ttft_ms=arrived_ms,
-                        endpoint="search",
-                        upstream_id=upstream.get("id"),
-                    )
-                    out_headers = _upstream_response_headers(resp)
-                    out_headers.update(
-                        {
-                            "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
-                            "x-switch-codex-pool": _header_safe(umodel),
-                            "x-switch-codex-route-pool": _header_safe(route_pool),
-                            "x-switch-codex-active-model": _header_safe(active),
-                        }
-                    )
-                    if client_model is not None:
-                        out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
-                    await client.aclose()
-                    return Response(
-                        content=raw,
-                        status_code=resp.status_code,
-                        headers=out_headers,
-                        media_type=resp.headers.get("content-type", "application/json"),
-                    )
-
-                async def stream_body(
-                    r=resp,
-                    c=client,
-                    up=upstream,
-                    uurl=upstream_url,
-                    arrived=arrived_ms,
-                ):
-                    state: dict[str, Any] = {
-                        "response": r,
-                        "upstream": up.get("name"),
-                        "downstream_started": False,
-                        "stream_retries": 0,
-                        "stream_completed": False,
-                        "stream_error": None,
-                        "client_disconnect": False,
-                        "usage": None,
-                        "ttft_ms": None,
-                    }
-
-                    async def open_retry() -> httpx.Response:
-                        return await _forward_once(
-                            c,
-                            up,
-                            method,
-                            path_suffix,
-                            body,
-                            content_type,
-                            extra,
-                            client_model,
-                        )
-
-                    async def consume_attempt(
-                        attempt_response: httpx.Response,
-                    ) -> AsyncIterator[bytes]:
-                        sink = _UsageSink()
-                        sse_buf = _SseLineBuffer()
-                        first_ms = None
-                        completed = False
-                        try:
-                            async for chunk in attempt_response.aiter_bytes():
-                                if first_ms is None:
-                                    first_ms = (time.perf_counter() - t0) * 1000.0
-                                if chunk:
-                                    for line in sse_buf.feed(chunk):
-                                        sink.feed_line(line)
-                                        completed = (
-                                            completed or _responses_stream_terminal_line(line)
-                                        )
-                                    yield chunk
-                            leftover = sse_buf.flush()
-                            if leftover:
-                                sink.feed_line(leftover)
-                                completed = (
-                                    completed or _responses_stream_terminal_line(leftover)
-                                )
-                        finally:
-                            state["usage"] = sink.usage
-                            state["stream_completed"] = completed
-                            if first_ms is not None and state["ttft_ms"] is None:
-                                state["ttft_ms"] = first_ms
-
-                    try:
-                        async for chunk in _stream_with_preoutput_retry(
-                            r,
-                            open_retry,
-                            state,
-                            consume_attempt,
-                            lambda: bool(state["stream_completed"]),
-                            "stream failure",
-                        ):
-                            yield chunk
-                    except asyncio.CancelledError:
-                        state["client_disconnect"] = True
-                        raise
-                    except GeneratorExit:
-                        state["client_disconnect"] = True
-                        raise
-                    except Exception as e:
-                        state["stream_error"] = f"stream aborted: {e}"
-                        # With no downstream bytes, end the stream bare so the
-                        # Codex client can enter its own reconnect path. Once
-                        # output has started, preserve the existing error SSE.
-                        if state["downstream_started"]:
-                            try:
-                                yield _sse_error_bytes(str(e))
-                            except Exception:
-                                pass
-                    finally:
-                        active_response = state["response"]
-                        await _aclose_quietly(active_response, c)
-                        stream_err_log_id = None
-                        ok = bool(state["stream_completed"]) and not state["stream_error"]
-                        if state["stream_error"] and not state["client_disconnect"]:
-                            stream_err_log_id = record_error(
-                                status=active_response.status_code,
-                                error=state["stream_error"],
-                                attempts=list(errors),
-                            )
-                        if ok and not state["client_disconnect"] and client_model:
-                            probes._set_model_availability(
-                                str(client_model),
-                                _live_ok_payload(
-                                    str(client_model), route_pool, up, active_response.status_code
-                                ),
-                            )
-                        record(
-                            status=active_response.status_code,
-                            upstream=up.get("name"),
-                            url=uurl,
-                            multiplier=core.upstream_multiplier_value(up),
-                            error_log_id=stream_err_log_id,
-                            attempts=list(errors) if errors else None,
-                            usage=state["usage"],
-                            duration_ms=(time.perf_counter() - t0) * 1000.0,
-                            ttft_ms=state["ttft_ms"] if state["ttft_ms"] is not None else arrived,
-                            upstream_id=up.get("id"),
-                            stream_completed=bool(state["stream_completed"]),
-                            stream_error=state["stream_error"],
-                            client_disconnect=bool(state["client_disconnect"]),
-                            downstream_started=bool(state["downstream_started"]),
-                            stream_retries=int(state["stream_retries"] or 0),
-                        )
-
-                ct = resp.headers.get("content-type")
-                out_headers = _stream_headers(
-                    _upstream_response_headers(
-                        resp,
-                        {
-                            "content-type": ct or "text/event-stream",
-                            "x-switch-codex-upstream": _header_safe(
-                                upstream.get("name", "")
-                            ),
-                            "x-switch-codex-pool": _header_safe(umodel),
-                            "x-switch-codex-route-pool": _header_safe(route_pool),
-                            "x-switch-codex-active-model": _header_safe(active),
-                        },
-                    )
-                )
-                if client_model is not None:
-                    out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
-                return StreamingResponse(
-                    stream_body(),
-                    status_code=resp.status_code,
-                    headers=out_headers,
-                    media_type=ct,
-                )
-
-            upstream_headers = _upstream_response_headers(resp)
-            err_text = (await resp.aread()).decode("utf-8", errors="replace")
-            await resp.aclose()
-            capacity_error = _is_capacity_error(err_text)
-            failover = (
-                capacity_error
-                or resp.status_code in FAILOVER_STATUS
-                or resp.status_code >= 500
-            )
-            if resp.status_code in (401, 403):
-                if auth_failovers >= 1:
-                    failover = False
-                else:
-                    auth_failovers += 1
-                    failover = True
-            log.warning(
-                "upstream=%s status=%s failover=%s body=%s",
-                upstream.get("name"),
-                resp.status_code,
-                failover,
-                err_text[:300],
-            )
-            if (
-                is_preferred
-                and failover
-                and _is_preferred_retryable(resp.status_code, capacity_error)
-                and preferred_retries_left > 0
-            ):
-                preferred_retries_left -= 1
-                retry_no = PREFERRED_RETRY_COUNT - preferred_retries_left
-                log.warning(
-                    "upstream=%s status=%s body=%s (preferred retry %d/%d)",
-                    upstream.get("name"),
-                    resp.status_code,
-                    err_text[:300],
-                    retry_no,
-                    PREFERRED_RETRY_COUNT,
-                )
-                await _preferred_retry_sleep(retry_no)
-                continue
-            if uid:
-                failed_ids.add(uid)
-            probes.mark_model_upstream_failed(
-                client_model,
-                upstream,
-                status=resp.status_code,
-                error=err_text[:500],
-            )
-            attempt = {
+        resp = await _forward_once(
+            client, upstream, path_suffix, body, content_type, extra
+        )
+    except Exception as e:
+        await client.aclose()
+        log.warning("upstream=%s connection error: %s", upstream.get("name"), e)
+        probes.mark_model_upstream_failed(client_model, upstream, status=None, error=str(e))
+        errors.append(
+            {
                 "upstream": upstream.get("name"),
                 "pool": umodel,
                 "priority": int(upstream.get("priority", 100)),
                 "multiplier": core.upstream_multiplier_value(upstream),
-                "url": upstream_url,
-                "status": resp.status_code,
-                "error": err_text[:ERROR_LOG_ATTEMPT_BODY_MAX],
-                "failover": failover,
-                "capacity_error": capacity_error,
+                "status": None,
+                "error": str(e),
+                "failover": False,
             }
-            if is_preferred:
-                attempt["retries"] = PREFERRED_RETRY_COUNT - preferred_retries_left
-            errors.append(attempt)
-            if not failover:
-                eid = record_error(
-                    status=resp.status_code,
-                    error=err_text[:500],
-                    attempts=list(errors),
-                )
-                record(
-                    status=resp.status_code,
-                    upstream=upstream.get("name"),
-                    url=upstream_url,
-                    multiplier=core.upstream_multiplier_value(upstream),
-                    error_log_id=eid,
-                    attempts=list(errors) if errors else None,
-                    endpoint=(
-                        "search"
-                        if standalone_search
-                        else ("chat" if upstream.get("chat_completions") else None)
-                    ),
-                )
-                await client.aclose()
-                return Response(
-                    content=err_text,
-                    status_code=resp.status_code,
-                    media_type=resp.headers.get("content-type", "application/json"),
-                    headers={
-                        **upstream_headers,
-                        "x-switch-codex-upstream": _header_safe(
-                            upstream.get("name", "")
-                        ),
+        )
+        eid = record_error(status=None, error=f"proxy exception: {e}", attempts=list(errors))
+        record(status=None, error_log_id=eid, attempts=list(errors) if errors else None)
+        raise HTTPException(status_code=502, detail=f"upstream connection error: {e}")
+
+    upstream_url = str(resp.request.url) if resp.request is not None else ""
+    arrived_ms = (time.perf_counter() - t0) * 1000.0
+    out_ct = resp.headers.get("content-type", "")
+
+    if resp.status_code < 400:
+        log.info(
+            "success upstream=%s pool=%s status=%s",
+            upstream.get("name"),
+            umodel,
+            resp.status_code,
+        )
+
+        if "event-stream" in out_ct:
+            async def stream_body(
+                r=resp,
+                c=client,
+                up=upstream,
+                uurl=upstream_url,
+                arrived=arrived_ms,
+            ):
+                sink = _UsageSink()
+                sse_buf = _SseLineBuffer()
+                stream_error = None
+                client_disconnect = False
+                first_ms = None
+                try:
+                    async for chunk in r.aiter_bytes():
+                        if first_ms is None:
+                            first_ms = (time.perf_counter() - t0) * 1000.0
+                        if chunk:
+                            for line in sse_buf.feed(chunk):
+                                sink.feed_line(line)
+                            yield chunk
+                    leftover = sse_buf.flush()
+                    if leftover:
+                        sink.feed_line(leftover)
+                except asyncio.CancelledError:
+                    client_disconnect = True
+                    raise
+                except Exception as e:
+                    stream_error = f"stream aborted: {e}"
+                    try:
+                        yield _sse_error_bytes(str(e))
+                    except Exception:
+                        pass
+                finally:
+                    await _aclose_quietly(r, c)
+                    stream_err_log_id = None
+                    if stream_error and not client_disconnect:
+                        stream_err_log_id = record_error(
+                            status=r.status_code,
+                            error=stream_error,
+                            attempts=list(errors),
+                        )
+                    if stream_error is None and not client_disconnect and client_model:
+                        probes._set_model_availability(
+                            str(client_model),
+                            _live_ok_payload(
+                                str(client_model), route_pool, up, r.status_code
+                            ),
+                        )
+                    record(
+                        status=r.status_code,
+                        upstream=up.get("name"),
+                        url=uurl,
+                        multiplier=core.upstream_multiplier_value(up),
+                        error_log_id=stream_err_log_id,
+                        attempts=list(errors) if errors else None,
+                        usage=sink.usage,
+                        duration_ms=(time.perf_counter() - t0) * 1000.0,
+                        ttft_ms=first_ms if first_ms is not None else arrived,
+                        endpoint=("search" if standalone_search else None),
+                        upstream_id=up.get("id"),
+                    )
+
+            out_headers = _stream_headers(
+                _upstream_response_headers(
+                    resp,
+                    {
+                        "content-type": out_ct or "text/event-stream",
+                        "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
                         "x-switch-codex-pool": _header_safe(umodel),
                         "x-switch-codex-route-pool": _header_safe(route_pool),
                         "x-switch-codex-active-model": _header_safe(active),
                     },
                 )
+            )
+            if client_model is not None:
+                out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
+            return StreamingResponse(
+                stream_body(),
+                status_code=resp.status_code,
+                headers=out_headers,
+                media_type=out_ct,
+            )
 
-            # 首选上游重试耗尽后仍失败：后台重级联，请求改走剩余候选，不阻塞 30s 探测。
-            if is_preferred:
-                cascaded_once = True
-                log.info(
-                    "re-cascade after failover model=%s failed=%s exclude=%s",
-                    client_model,
-                    upstream.get("name"),
-                    list(failed_ids),
-                )
-                await _kick_recascade(client_model, failed_ids, timeout)
-                candidates = core.order_candidates_for_model(
-                    client_model, route_pool, exclude_ids=set(failed_ids)
-                )
-                if standalone_search:
-                    candidates = [
-                        u for u in candidates
-                        if core.upstream_supports_standalone_web_search(u)
-                    ]
-                prefer_name = candidates[0].get("name") if candidates else None
-                idx = 0
-            else:
-                idx += 1
+        # 非流式（含 standalone search 的 JSON 信封）：读 body 透传 + 提取 usage。
+        upstream_headers = _upstream_response_headers(resp)
+        raw = await resp.aread()
+        await resp.aclose()
+        usage = logbook._extract_usage(raw)
+        if client_model:
+            probes._set_model_availability(
+                str(client_model),
+                _live_ok_payload(str(client_model), route_pool, upstream, resp.status_code),
+            )
+        record(
+            status=resp.status_code,
+            upstream=upstream.get("name"),
+            url=upstream_url,
+            multiplier=core.upstream_multiplier_value(upstream),
+            attempts=list(errors) if errors else None,
+            usage=usage,
+            duration_ms=(time.perf_counter() - t0) * 1000.0,
+            ttft_ms=arrived_ms,
+            endpoint=("search" if standalone_search else None),
+            upstream_id=upstream.get("id"),
+        )
         await client.aclose()
-    except Exception as e:
-        await client.aclose()
-        eid = record_error(status=None, error=f"proxy exception: {e}", attempts=list(errors))
-        record(status=None, error_log_id=eid, attempts=list(errors) if errors else None)
-        raise
+        return Response(
+            content=raw,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type", "application/json"),
+            headers={
+                **upstream_headers,
+                "content-type": resp.headers.get("content-type", "application/json"),
+                "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
+                "x-switch-codex-pool": _header_safe(umodel),
+                "x-switch-codex-route-pool": _header_safe(route_pool),
+                "x-switch-codex-active-model": _header_safe(active),
+            },
+        )
 
-    # 全部上游失败时，优先透传第一个可用的 4xx（如 429 限流），
-    # 让请求日志与错误日志状态一致；没有 4xx 才回 502。
-    final_status = 502
-    first_4xx = next(
-        (
-            a.get("status")
-            for a in errors
-            if isinstance(a.get("status"), int) and 400 <= a["status"] < 500
-        ),
-        None,
+    # 上游错误（>=400）：如实返回，不做 failover。
+    upstream_headers = _upstream_response_headers(resp)
+    err_text = (await resp.aread()).decode("utf-8", errors="replace")
+    await resp.aclose()
+    log.warning(
+        "upstream=%s status=%s body=%s",
+        upstream.get("name"),
+        resp.status_code,
+        err_text[:300],
     )
-    if first_4xx is not None:
-        final_status = first_4xx
+    probes.mark_model_upstream_failed(
+        client_model, upstream, status=resp.status_code, error=err_text[:500]
+    )
+    errors.append(
+        {
+            "upstream": upstream.get("name"),
+            "pool": umodel,
+            "priority": int(upstream.get("priority", 100)),
+            "multiplier": core.upstream_multiplier_value(upstream),
+            "url": upstream_url,
+            "status": resp.status_code,
+            "error": err_text[:ERROR_LOG_ATTEMPT_BODY_MAX],
+            "failover": False,
+        }
+    )
     eid = record_error(
-        status=final_status,
-        error="all upstreams failed: " + json.dumps(errors, ensure_ascii=False)[:1000],
+        status=resp.status_code,
+        error=err_text[:500],
         attempts=list(errors),
     )
     record(
-        status=final_status,
+        status=resp.status_code,
+        upstream=upstream.get("name"),
+        url=upstream_url,
+        multiplier=core.upstream_multiplier_value(upstream),
         error_log_id=eid,
         attempts=list(errors) if errors else None,
+        endpoint=("search" if standalone_search else None),
     )
-    return JSONResponse(
-        status_code=final_status,
-        content={
-            "error": {
-                "message": (
-                    f"All upstreams failed for client_model={client_model!r} "
-                    f"route_pool={route_pool} active_model={active}"
-                ),
-                "type": "router_error",
-                "active_model": active,
-                "route_pool": route_pool,
-                "client_model": client_model,
-                "attempts": errors,
-            }
+    await client.aclose()
+    return Response(
+        content=err_text,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+        headers={
+            **upstream_headers,
+            "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
+            "x-switch-codex-pool": _header_safe(umodel),
+            "x-switch-codex-route-pool": _header_safe(route_pool),
+            "x-switch-codex-active-model": _header_safe(active),
         },
     )
 
@@ -1286,9 +671,11 @@ async def proxy_anthropic_messages(
     request: Request,
     _: str = Depends(auth.require_client_key),
 ):
-    """Claude Code 兼容端点：Anthropic Messages → OpenAI Responses 转换后
-    走与 /v1/responses 完全平行的多上游路由、failover 与重级联；响应再转回
-    Anthropic 格式（非流式 JSON 或 event-stream SSE）。"""
+    """纯透传 /v1/messages：Anthropic Messages 原生透传到 anthropic_messages 上游。
+
+    不做 Anthropic↔Responses 转换；上游必须声明 anthropic_messages=True。
+    失败如实返回，不做 failover。
+    """
     cfg = core.load_config()
     timeout = float(cfg.get("timeout_sec", 120))
     active = core.normalize_model(cfg.get("active_model"))
@@ -1313,9 +700,6 @@ async def proxy_anthropic_messages(
     session_id = logbook._extract_session_id(
         {k.lower(): v for k, v in request.headers.items()}, _j
     )
-    # 先置默认值：错误路径的 record()/record_error() 调用早于完整解析（如非法
-    # JSON 的 400 分支），闭包引用不能未定义（此前只预置了 is_classifier）。
-    is_classifier = False
     client_model = None
     stream = False
     reasoning_effort = None
@@ -1334,11 +718,6 @@ async def proxy_anthropic_messages(
         duration_ms: Optional[float] = None,
         ttft_ms: Optional[float] = None,
         upstream_id: Optional[str] = None,
-        stream_completed: Optional[bool] = None,
-        stream_error: Optional[str] = None,
-        client_disconnect: Optional[bool] = None,
-        downstream_started: Optional[bool] = None,
-        stream_retries: Optional[int] = None,
     ) -> None:
         logbook._record_log(
             client_ip=client_ip,
@@ -1348,7 +727,6 @@ async def proxy_anthropic_messages(
             pool=core.resolve_route_pool(client_model, active),
             client_model=client_model,
             reasoning_effort=reasoning_effort,
-            is_classifier=is_classifier,
             upstream=upstream,
             upstream_id=upstream_id,
             upstream_url=url,
@@ -1363,11 +741,6 @@ async def proxy_anthropic_messages(
             error_log_id=error_log_id,
             attempts=attempts,
             stream=stream,
-            stream_completed=stream_completed,
-            stream_error=stream_error,
-            client_disconnect=client_disconnect,
-            downstream_started=downstream_started,
-            stream_retries=stream_retries,
             **logbook._usage_numbers(usage),
         )
 
@@ -1397,7 +770,7 @@ async def proxy_anthropic_messages(
             attempts=attempts or [],
         )
 
-    # 解析 Anthropic Messages 请求 → Responses 请求体（model 原样透传，路由关键）。
+    # 解析（仅用于日志/路由；body 原样透传）
     try:
         j = json.loads(body) if body else {}
     except Exception:
@@ -1408,36 +781,10 @@ async def proxy_anthropic_messages(
         j = {}
     client_model = j.get("model")
     stream = bool(j.get("stream", False))
-    # 思考强度：统一走 anthropic._resolve_reasoning_effort 归一化（thinking /
-    # output_config / reasoning_effort 三种客户端写法 → 真实 effort 值），
-    # 日志记录与转换共用同一逻辑，避免标记字符串漂移。
-    reasoning_effort = anthropic._resolve_reasoning_effort(j)
-    # Claude Code auto-mode 分类器：非流式 + 无 effort 信号。强制 low（分类
-    # 判定用不到高强度思考，省延迟省 token）+ 打标，便于日志区分主对话流。
-    is_classifier = anthropic.looks_like_classifier(j)
-    if is_classifier:
-        reasoning_effort = "low"
-    req_payload = anthropic.anthropic_body_to_responses(j)
-    # openai-all 是池标识而非真实模型名：Claude Code 发 model=openai-all 时，
-    # 映射到该池的默认入口模型（gpt-5.6-luna），使路由候选与上游 model_map 匹配。
-    if client_model == core.DEFAULT_MODEL:
-        client_model = core.DEFAULT_CLIENT_MODELS[0]
-        req_payload["model"] = client_model
-    # reasoning 注入（分类器强制 low / 客户端显式 effort）：仅对支持 reasoning
-    # 参数的模型注入——不支持的池收到陌生参数会被上游 400。映射后才判定，
-    # 保证 openai-all 池按入口模型（gpt-5.6-luna）判断。
-    if is_classifier:
-        target = str(req_payload.get("model") or client_model)
-        if anthropic._supports_reasoning_effort(target):
-            req_payload["reasoning"] = {"effort": "low"}
-    else:
-        effort = anthropic._resolve_reasoning_effort(j)
-        if effort and anthropic._supports_reasoning_effort(str(client_model)):
-            req_payload["reasoning"] = {"effort": effort}
-    upstream_body = json.dumps(req_payload, ensure_ascii=False).encode("utf-8")
-    req_body, req_body_len, req_body_trunc = logbook._request_body_for_log(upstream_body)
+    reasoning_effort = logbook._extract_reasoning_effort(j)
+    req_body, req_body_len, req_body_trunc = logbook._request_body_for_log(body)
 
-    # 公网调用开关 + IP 黑白名单（与 /v1/responses 一致）。
+    # 公网调用开关 + IP 黑白名单。
     if is_public_request:
         if not core.public_access_enabled():
             eid = record_error(status=403, error="public access disabled")
@@ -1448,711 +795,249 @@ async def proxy_anthropic_messages(
             record(status=403, error_log_id=eid)
             raise HTTPException(status_code=403, detail="IP not allowed")
 
-    # 按客户端模型路由：优先可用性缓存胜者，其次倍率低→高；
-    # 首选失败先同渠道重试，重试耗尽才重级联。
+    # 按模型池选定上游：仅支持 anthropic_messages 原生上游（纯透传无转换层）。
     route_pool = core.resolve_route_pool(client_model, active)
-    failed_ids: set[str] = set()
-    cascaded_once = False
-    candidates = core.order_candidates_for_model(client_model, route_pool)
+    candidates = [
+        u
+        for u in core.order_candidates_for_model(client_model, route_pool)
+        if u.get("anthropic_messages")
+    ]
     if not candidates:
         route_pool = active
-        candidates = core.order_candidates_for_model(client_model, route_pool)
+        candidates = [
+            u
+            for u in core.order_candidates_for_model(client_model, route_pool)
+            if u.get("anthropic_messages")
+        ]
     if not candidates:
-        eid = record_error(status=503, error="no enabled upstreams for route pool")
+        eid = record_error(
+            status=503,
+            error="no anthropic-messages upstream for route pool",
+        )
         record(status=503, error_log_id=eid)
         raise HTTPException(
             status_code=503,
             detail=(
-                f"无可用上游: route_pool={route_pool!r} "
-                f"(client_model={client_model!r}, active_model={active!r})。"
-                f"请为该池添加或启用上游。"
+                f"No anthropic-messages upstream for route_pool={route_pool!r} "
+                f"(client_model={client_model!r}, active_model={active!r}). "
+                f"纯透传模式下 /v1/messages 只支持 anthropic_messages 上游。"
             ),
         )
 
-    prefer_name = candidates[0].get("name") if candidates else None
+    upstream = candidates[0]
+    umodel = core.normalize_model(upstream.get("model"))
     log.info(
-        "proxy(claude) active_pool=%s route_pool=%s client_model=%s prefer=%s candidates=%s",
+        "proxy(claude) active_pool=%s route_pool=%s client_model=%s upstream=%s",
         active,
         route_pool,
         client_model,
-        prefer_name,
-        [u.get("name") for u in candidates],
+        upstream.get("name"),
     )
 
     errors: list[dict] = []
     client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
-    idx = 0
-    auth_failovers = 0
-    preferred_retries_left = PREFERRED_RETRY_COUNT
-
     try:
-        while idx < len(candidates):
-            upstream = candidates[idx]
-            uid = str(upstream.get("id") or "")
-            umodel = core.normalize_model(upstream.get("model"))
-            is_preferred = bool(
-                not cascaded_once
-                and client_model
-                and prefer_name
-                and upstream.get("name") == prefer_name
-            )
-            # 双模式：上游声明 anthropic_messages 时原生透传（body 用原始 Anthropic 请求），
-            # 否则走 Responses 转换层（body 用转换后的 upstream_body）。
-            passthrough_mode = bool(upstream.get("anthropic_messages"))
-            # 透传模式也改写 model：客户端恒发 openai-all 池标识（或 DeepSeek
-            # slug），真实 Anthropic 网关不认。按上游 model_map 改写后再转发；
-            # 无映射时 _rewrite_request_model 原样返回，行为同改造前。
-            forward_body = upstream_body
-            if passthrough_mode:
-                request_model = core.upstream_request_model(upstream, client_model)
-                if request_model is None:
-                    # 上游 model_map 可能以原始客户端标识为键（如 openai-all），
-                    # 归一化后的 client_model 查不到时用 body 里的原值再查一次。
-                    request_model = core.upstream_request_model(upstream, j.get("model"))
-                forward_body = _rewrite_request_model(body, request_model)
-            try:
-                resp = await _forward_once(
-                    client,
-                    upstream,
-                    method,
-                    "responses",
-                    forward_body,
-                    content_type,
-                    extra,
-                    client_model,
-                    passthrough=passthrough_mode,
-                )
-            except Exception as e:
-                retryable = is_preferred and _is_preferred_retryable(None, False)
-                if retryable and preferred_retries_left > 0:
-                    preferred_retries_left -= 1
-                    retry_no = PREFERRED_RETRY_COUNT - preferred_retries_left
-                    log.warning(
-                        "upstream=%s connection error: %s "
-                        "(preferred retry %d/%d)",
-                        upstream.get("name"),
-                        e,
-                        retry_no,
-                        PREFERRED_RETRY_COUNT,
-                    )
-                    await _preferred_retry_sleep(retry_no)
-                    continue
-                log.warning("upstream=%s connection error: %s", upstream.get("name"), e)
-                if uid:
-                    failed_ids.add(uid)
-                probes.mark_model_upstream_failed(
-                    client_model, upstream, status=None, error=str(e)
-                )
-                attempt = {
-                    "upstream": upstream.get("name"),
-                    "pool": umodel,
-                    "priority": int(upstream.get("priority", 100)),
-                    "multiplier": core.upstream_multiplier_value(upstream),
-                    "status": None,
-                    "error": str(e),
-                    "failover": True,
-                }
-                if is_preferred:
-                    attempt["retries"] = PREFERRED_RETRY_COUNT - preferred_retries_left
-                errors.append(attempt)
-                if is_preferred:
-                    cascaded_once = True
-                    log.info(
-                        "re-cascade after connection fail model=%s exclude=%s",
-                        client_model,
-                        list(failed_ids),
-                    )
-                    await _kick_recascade(client_model, failed_ids, timeout)
-                    candidates = core.order_candidates_for_model(
-                        client_model, route_pool, exclude_ids=set(failed_ids)
-                    )
-                    prefer_name = candidates[0].get("name") if candidates else None
-                    idx = 0
-                else:
-                    idx += 1
-                continue
-
-            upstream_url = str(resp.request.url) if resp.request is not None else ""
-
-            if resp.status_code < 400:
-                log.info(
-                    "success upstream=%s pool=%s status=%s",
-                    upstream.get("name"),
-                    umodel,
-                    resp.status_code,
-                )
-                arrived_ms = (time.perf_counter() - t0) * 1000.0
-                out_ct = resp.headers.get("content-type", "")
-
-                if passthrough_mode:
-                    # 原生透传：上游响应本身就是 Anthropic Messages 格式，原样返回（零转换）。
-                    if "event-stream" in out_ct:
-
-                        async def stream_passthrough(
-                            r=resp,
-                            c=client,
-                            up=upstream,
-                            uurl=upstream_url,
-                            arrived=arrived_ms,
-                        ):
-                            sink = _UsageSink()
-                            sse_buf = _SseLineBuffer()
-                            stream_error = None
-                            client_disconnect = False
-                            first_ms = None
-                            try:
-                                async for chunk in r.aiter_bytes():
-                                    if first_ms is None:
-                                        first_ms = (time.perf_counter() - t0) * 1000.0
-                                    if chunk:
-                                        for line in sse_buf.feed(chunk):
-                                            sink.feed_line(line)
-                                        yield chunk
-                            except asyncio.CancelledError:
-                                client_disconnect = True
-                                raise
-                            except Exception as e:
-                                stream_error = f"stream aborted: {e}"
-                                try:
-                                    yield _sse_error_bytes(str(e))
-                                except Exception:
-                                    pass
-                            finally:
-                                leftover = sse_buf.flush()
-                                if leftover:
-                                    sink.feed_line(leftover)
-                                await _aclose_quietly(r, c)
-                                stream_err_log_id = None
-                                ok = stream_error is None
-                                if stream_error and not client_disconnect:
-                                    stream_err_log_id = record_error(
-                                        status=r.status_code,
-                                        error=stream_error,
-                                        attempts=list(errors),
-                                    )
-                                if ok and not client_disconnect and client_model:
-                                    probes._set_model_availability(
-                                        str(client_model),
-                                        _live_ok_payload(
-                                            str(client_model), route_pool, up, r.status_code
-                                        ),
-                                    )
-                                record(
-                                    status=r.status_code,
-                                    upstream=up.get("name"),
-                                    url=uurl,
-                                    multiplier=core.upstream_multiplier_value(up),
-                                    error_log_id=stream_err_log_id,
-                                    attempts=list(errors) if errors else None,
-                                    usage=sink.usage,
-                                    duration_ms=(time.perf_counter() - t0) * 1000.0,
-                                    ttft_ms=first_ms if first_ms is not None else arrived,
-                                    upstream_id=up.get("id"),
-                                )
-
-                        out_headers = _stream_headers(
-                            _upstream_response_headers(
-                                resp,
-                                {
-                                    "content-type": out_ct or "text/event-stream",
-                                    "x-switch-codex-upstream": _header_safe(
-                                        upstream.get("name", "")
-                                    ),
-                                    "x-switch-codex-pool": _header_safe(umodel),
-                                    "x-switch-codex-route-pool": _header_safe(route_pool),
-                                    "x-switch-codex-active-model": _header_safe(active),
-                                },
-                            )
-                        )
-                        if client_model is not None:
-                            out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
-                        return StreamingResponse(
-                            stream_passthrough(),
-                            status_code=resp.status_code,
-                            headers=out_headers,
-                            media_type=out_ct or "text/event-stream",
-                        )
-                    upstream_headers = _upstream_response_headers(resp)
-                    raw = await resp.aread()
-                    await resp.aclose()
-                    usage = logbook._extract_usage(raw)
-                    if client_model:
-                        probes._set_model_availability(
-                            str(client_model),
-                            _live_ok_payload(
-                                str(client_model), route_pool, upstream, 200
-                            ),
-                        )
-                    record(
-                        status=200,
-                        upstream=upstream.get("name"),
-                        url=upstream_url,
-                        multiplier=core.upstream_multiplier_value(upstream),
-                        attempts=list(errors) if errors else None,
-                        usage=usage,
-                        duration_ms=(time.perf_counter() - t0) * 1000.0,
-                        ttft_ms=arrived_ms,
-                        upstream_id=upstream.get("id"),
-                    )
-                    out_headers = {
-                        **upstream_headers,
-                        "content-type": resp.headers.get("content-type", "application/json"),
-                        "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
-                        "x-switch-codex-pool": _header_safe(umodel),
-                        "x-switch-codex-route-pool": _header_safe(route_pool),
-                        "x-switch-codex-active-model": _header_safe(active),
-                    }
-                    if client_model is not None:
-                        out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
-                    await client.aclose()
-                    return Response(
-                        content=raw,
-                        status_code=200,
-                        media_type="application/json",
-                        headers=out_headers,
-                    )
-
-                chat_mode = bool(upstream.get("chat_completions"))
-                if "event-stream" in out_ct:
-                    # 流式：上游 SSE → Anthropic Messages SSE。
-                    # - chat_completions 上游：先 ChatSseToResponses → Responses SSE，
-                    #   再 ResponsesSseToAnthropic → Anthropic SSE；
-                    # - 其它上游：直接 Responses SSE → Anthropic SSE。
-                    converter = anthropic.ResponsesSseToAnthropic()
-                    converter.model = client_model or upstream.get("model") or ""
-                    chat_conv = convert.ChatSseToResponses() if chat_mode else None
-
-                    def feed_responses_sse(sse_list: list[str]) -> list[str]:
-                        """把 ChatSseToResponses 产出的 Responses SSE 字符串喂给
-                        ResponsesSseToAnthropic，返回应下发的 Anthropic SSE 列表。"""
-                        out: list[str] = []
-                        for ev in sse_list:
-                            for line in ev.splitlines():
-                                line = line.strip()
-                                if not line.startswith("data:"):
-                                    continue
-                                data = line[5:].strip()
-                                if data == "[DONE]" or not data.startswith("{"):
-                                    continue
-                                try:
-                                    obj = json.loads(data)
-                                except Exception:
-                                    continue
-                                out.extend(converter.handle_chunk(obj))
-                        return out
-
-                    async def stream_body_convert(
-                        r=resp,
-                        c=client,
-                        up=upstream,
-                        uurl=upstream_url,
-                        conv=converter,
-                        chatc=chat_conv,
-                        arrived=arrived_ms,
-                    ):
-                        sink = _UsageSink()
-                        sse_buf = _SseLineBuffer()
-                        stream_error = None
-                        client_disconnect = False
-                        first_ms = None
-                        chat_finalized = False
-                        try:
-                            async for chunk in r.aiter_bytes():
-                                if first_ms is None:
-                                    first_ms = (time.perf_counter() - t0) * 1000.0
-                                if not chunk:
-                                    continue
-                                for line in sse_buf.feed(chunk):
-                                    stripped = line.strip()
-                                    if not stripped.startswith("data:"):
-                                        continue
-                                    data = stripped[5:].strip()
-                                    if data == "[DONE]":
-                                        if chatc is not None and not chat_finalized:
-                                            chat_finalized = True
-                                            events = feed_responses_sse(chatc.finalize())
-                                        else:
-                                            events = conv.finalize()
-                                    elif data.startswith("{"):
-                                        try:
-                                            obj = json.loads(data)
-                                        except Exception:
-                                            continue
-                                        sink.feed_obj(obj)
-                                        if chatc is not None:
-                                            events = feed_responses_sse(
-                                                chatc.handle_chunk(obj)
-                                            )
-                                        else:
-                                            events = conv.handle_chunk(obj)
-                                    else:
-                                        continue
-                                    for ev in events:
-                                        yield ev.encode("utf-8")
-                            leftover = sse_buf.flush()
-                            if leftover and leftover.strip().startswith("data:"):
-                                data = leftover.strip()[5:].strip()
-                                if data == "[DONE]":
-                                    if chatc is not None and not chat_finalized:
-                                        chat_finalized = True
-                                        events = feed_responses_sse(chatc.finalize())
-                                    else:
-                                        events = conv.finalize()
-                                    for ev in events:
-                                        yield ev.encode("utf-8")
-                                elif data.startswith("{"):
-                                    try:
-                                        obj = json.loads(data)
-                                    except Exception:
-                                        obj = None
-                                    if obj is not None:
-                                        sink.feed_obj(obj)
-                                        if chatc is not None:
-                                            events = feed_responses_sse(
-                                                chatc.handle_chunk(obj)
-                                            )
-                                        else:
-                                            events = conv.handle_chunk(obj)
-                                        for ev in events:
-                                            yield ev.encode("utf-8")
-                            if chatc is not None and not chat_finalized:
-                                chat_finalized = True
-                                for ev in feed_responses_sse(chatc.finalize()):
-                                    yield ev.encode("utf-8")
-                            if not conv.is_completed():
-                                for ev in conv.finalize():
-                                    yield ev.encode("utf-8")
-                        except asyncio.CancelledError:
-                            client_disconnect = True
-                            raise
-                        except Exception as e:
-                            stream_error = f"stream aborted: {e}"
-                            try:
-                                yield conv.failed_event(str(e), "stream_error").encode("utf-8")
-                            except Exception:
-                                pass
-                        finally:
-                            await _aclose_quietly(r, c)
-                            stream_err_log_id = None
-                            ok = not stream_error and conv.is_completed()
-                            if not client_disconnect and not ok:
-                                reason = stream_error or "stream ended without message_stop"
-                                stream_err_log_id = record_error(
-                                    status=r.status_code,
-                                    error=reason,
-                                    attempts=list(errors),
-                                )
-                            if ok and not client_disconnect and client_model:
-                                probes._set_model_availability(
-                                    str(client_model),
-                                    _live_ok_payload(
-                                        str(client_model), route_pool, up, r.status_code
-                                    ),
-                                )
-                            record(
-                                status=r.status_code,
-                                upstream=up.get("name"),
-                                url=uurl,
-                                multiplier=core.upstream_multiplier_value(up),
-                                error_log_id=stream_err_log_id,
-                                attempts=list(errors) if errors else None,
-                                usage=conv.latest_usage or sink.usage,
-                                duration_ms=(time.perf_counter() - t0) * 1000.0,
-                                ttft_ms=first_ms if first_ms is not None else arrived,
-                                upstream_id=up.get("id"),
-                            )
-
-                    out_headers = _stream_headers({
-                        "content-type": "text/event-stream",
-                        "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
-                        "x-switch-codex-pool": _header_safe(umodel),
-                        "x-switch-codex-route-pool": _header_safe(route_pool),
-                        "x-switch-codex-active-model": _header_safe(active),
-                    })
-                    if client_model is not None:
-                        out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
-                    return StreamingResponse(
-                        stream_body_convert(),
-                        status_code=200,
-                        headers=out_headers,
-                        media_type="text/event-stream",
-                    )
-
-                # 非流式：上游返回 JSON（含客户端 stream=true 但上游非流式的兜底）。
-                upstream_headers = _upstream_response_headers(resp)
-                raw = await resp.aread()
-                await resp.aclose()
-                try:
-                    parsed = json.loads(raw)
-                except Exception:
-                    eid = record_error(
-                        status=502,
-                        error="upstream returned non-JSON",
-                        attempts=list(errors),
-                    )
-                    record(
-                        status=502,
-                        error_log_id=eid,
-                        attempts=list(errors) if errors else None,
-                        upstream=upstream.get("name"),
-                        url=upstream_url,
-                        upstream_id=upstream.get("id"),
-                    )
-                    await client.aclose()
-                    return JSONResponse(
-                        status_code=502,
-                        content=anthropic.anthropic_error_response(
-                            502, "upstream returned non-JSON"
-                        ),
-                    )
-                if chat_mode:
-                    try:
-                        resp_obj = convert.chat_response_to_responses(parsed)
-                    except Exception as e:
-                        eid = record_error(
-                            status=502,
-                            error=f"chat→responses conversion failed: {e}",
-                            attempts=list(errors),
-                        )
-                        record(status=502, error_log_id=eid, attempts=list(errors) if errors else None)
-                        await client.aclose()
-                        return JSONResponse(
-                            status_code=502,
-                            content=anthropic.anthropic_error_response(
-                                502, f"chat→responses conversion failed: {e}"
-                            ),
-                        )
-                else:
-                    resp_obj = parsed
-
-                # 从转换后的 Responses 对象提取 usage：chat 上游的原始 usage 是
-                # prompt_tokens/completion_tokens，需要先归一化成 responses 结构。
-                usage = logbook._extract_usage(
-                    json.dumps(resp_obj, ensure_ascii=False).encode("utf-8")
-                )
-                if client_model:
-                    probes._set_model_availability(
-                        str(client_model),
-                        _live_ok_payload(
-                            str(client_model), route_pool, upstream, 200
-                        ),
-                    )
-                if stream:
-                    # 客户端要流、上游却回 JSON：合成完整 Anthropic SSE 再下发
-                    # （借鉴 cc-switch streaming_responses.responses_json_to_anthropic_sse）。
-                    record(
-                        status=200,
-                        upstream=upstream.get("name"),
-                        url=upstream_url,
-                        multiplier=core.upstream_multiplier_value(upstream),
-                        attempts=list(errors) if errors else None,
-                        usage=usage,
-                        duration_ms=(time.perf_counter() - t0) * 1000.0,
-                        ttft_ms=arrived_ms,
-                        upstream_id=upstream.get("id"),
-                    )
-                    sse_events = anthropic.responses_json_to_anthropic_sse(resp_obj, req_payload)
-                    out_headers = {
-                        **upstream_headers,
-                        "content-type": "text/event-stream",
-                        "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
-                        "x-switch-codex-pool": _header_safe(umodel),
-                        "x-switch-codex-route-pool": _header_safe(route_pool),
-                        "x-switch-codex-active-model": _header_safe(active),
-                    }
-                    if client_model is not None:
-                        out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
-                    await client.aclose()
-                    return StreamingResponse(
-                        iter([ev.encode("utf-8") for ev in sse_events]),
-                        status_code=200,
-                        headers=out_headers,
-                        media_type="text/event-stream",
-                    )
-
-                out = anthropic.responses_response_to_anthropic(resp_obj, req_payload)
-                out_bytes = json.dumps(out, ensure_ascii=False).encode("utf-8")
-                record(
-                    status=200,
-                    upstream=upstream.get("name"),
-                    url=upstream_url,
-                    multiplier=core.upstream_multiplier_value(upstream),
-                    attempts=list(errors) if errors else None,
-                    usage=usage,
-                    duration_ms=(time.perf_counter() - t0) * 1000.0,
-                    ttft_ms=arrived_ms,
-                    upstream_id=upstream.get("id"),
-                )
-                out_headers = {
-                    **upstream_headers,
-                    "content-type": "application/json",
-                    "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
-                    "x-switch-codex-pool": _header_safe(umodel),
-                    "x-switch-codex-route-pool": _header_safe(route_pool),
-                    "x-switch-codex-active-model": _header_safe(active),
-                }
-                if client_model is not None:
-                    out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
-                await client.aclose()
-                return Response(
-                    content=out_bytes,
-                    status_code=200,
-                    media_type="application/json",
-                    headers=out_headers,
-                )
-
-            upstream_headers = _upstream_response_headers(resp)
-            err_text = (await resp.aread()).decode("utf-8", errors="replace")
-            await resp.aclose()
-            capacity_error = _is_capacity_error(err_text)
-            failover = (
-                capacity_error
-                or resp.status_code in FAILOVER_STATUS
-                or resp.status_code >= 500
-            )
-            if resp.status_code in (401, 403):
-                if auth_failovers >= 1:
-                    failover = False
-                else:
-                    auth_failovers += 1
-                    failover = True
-            log.warning(
-                "upstream=%s status=%s failover=%s body=%s",
-                upstream.get("name"),
-                resp.status_code,
-                failover,
-                err_text[:300],
-            )
-            if (
-                is_preferred
-                and failover
-                and _is_preferred_retryable(resp.status_code, capacity_error)
-                and preferred_retries_left > 0
-            ):
-                preferred_retries_left -= 1
-                retry_no = PREFERRED_RETRY_COUNT - preferred_retries_left
-                log.warning(
-                    "upstream=%s status=%s body=%s (preferred retry %d/%d)",
-                    upstream.get("name"),
-                    resp.status_code,
-                    err_text[:300],
-                    retry_no,
-                    PREFERRED_RETRY_COUNT,
-                )
-                await _preferred_retry_sleep(retry_no)
-                continue
-            if uid:
-                failed_ids.add(uid)
-            probes.mark_model_upstream_failed(
-                client_model,
-                upstream,
-                status=resp.status_code,
-                error=err_text[:500],
-            )
-            attempt = {
+        resp = await _forward_once(
+            client, upstream, "messages", body, content_type, extra, anthropic=True
+        )
+    except Exception as e:
+        await client.aclose()
+        log.warning("upstream=%s connection error: %s", upstream.get("name"), e)
+        probes.mark_model_upstream_failed(client_model, upstream, status=None, error=str(e))
+        errors.append(
+            {
                 "upstream": upstream.get("name"),
                 "pool": umodel,
                 "priority": int(upstream.get("priority", 100)),
                 "multiplier": core.upstream_multiplier_value(upstream),
-                "url": upstream_url,
-                "status": resp.status_code,
-                "error": err_text[:ERROR_LOG_ATTEMPT_BODY_MAX],
-                "failover": failover,
-                "capacity_error": capacity_error,
+                "status": None,
+                "error": str(e),
+                "failover": False,
             }
-            if is_preferred:
-                attempt["retries"] = PREFERRED_RETRY_COUNT - preferred_retries_left
-            errors.append(attempt)
-            if not failover:
-                eid = record_error(
-                    status=resp.status_code,
-                    error=err_text[:500],
-                    attempts=list(errors),
-                )
-                record(
-                    status=resp.status_code,
-                    upstream=upstream.get("name"),
-                    url=upstream_url,
-                    multiplier=core.upstream_multiplier_value(upstream),
-                    error_log_id=eid,
-                    attempts=list(errors) if errors else None,
-                    upstream_id=upstream.get("id"),
-                )
-                await client.aclose()
-                if not passthrough_mode:
-                    # 非透传上游的错误是 OpenAI/Responses 风格，需要包成 Anthropic
-                    # 错误信封，否则 Claude Code 解析不了（借鉴 cc-switch error_mapper）。
-                    err_text = json.dumps(
-                        anthropic.anthropic_error_response(
-                            resp.status_code, err_text[:500]
-                        ),
-                        ensure_ascii=False,
+        )
+        eid = record_error(status=None, error=f"proxy exception: {e}", attempts=list(errors))
+        record(status=None, error_log_id=eid, attempts=list(errors) if errors else None)
+        raise HTTPException(status_code=502, detail=f"upstream connection error: {e}")
+
+    upstream_url = str(resp.request.url) if resp.request is not None else ""
+    arrived_ms = (time.perf_counter() - t0) * 1000.0
+    out_ct = resp.headers.get("content-type", "")
+
+    if resp.status_code < 400:
+        log.info(
+            "success upstream=%s pool=%s status=%s",
+            upstream.get("name"),
+            umodel,
+            resp.status_code,
+        )
+
+        if "event-stream" in out_ct:
+            async def stream_passthrough(
+                r=resp,
+                c=client,
+                up=upstream,
+                uurl=upstream_url,
+                arrived=arrived_ms,
+            ):
+                sink = _UsageSink()
+                sse_buf = _SseLineBuffer()
+                stream_error = None
+                client_disconnect = False
+                first_ms = None
+                try:
+                    async for chunk in r.aiter_bytes():
+                        if first_ms is None:
+                            first_ms = (time.perf_counter() - t0) * 1000.0
+                        if chunk:
+                            for line in sse_buf.feed(chunk):
+                                sink.feed_line(line)
+                            yield chunk
+                    leftover = sse_buf.flush()
+                    if leftover:
+                        sink.feed_line(leftover)
+                except asyncio.CancelledError:
+                    client_disconnect = True
+                    raise
+                except Exception as e:
+                    stream_error = f"stream aborted: {e}"
+                    try:
+                        yield _sse_error_bytes(str(e))
+                    except Exception:
+                        pass
+                finally:
+                    await _aclose_quietly(r, c)
+                    stream_err_log_id = None
+                    if stream_error and not client_disconnect:
+                        stream_err_log_id = record_error(
+                            status=r.status_code,
+                            error=stream_error,
+                            attempts=list(errors),
+                        )
+                    if stream_error is None and not client_disconnect and client_model:
+                        probes._set_model_availability(
+                            str(client_model),
+                            _live_ok_payload(
+                                str(client_model), route_pool, up, r.status_code
+                            ),
+                        )
+                    record(
+                        status=r.status_code,
+                        upstream=up.get("name"),
+                        url=uurl,
+                        multiplier=core.upstream_multiplier_value(up),
+                        error_log_id=stream_err_log_id,
+                        attempts=list(errors) if errors else None,
+                        usage=sink.usage,
+                        duration_ms=(time.perf_counter() - t0) * 1000.0,
+                        ttft_ms=first_ms if first_ms is not None else arrived,
+                        upstream_id=up.get("id"),
                     )
-                    upstream_headers["content-type"] = "application/json"
-                return Response(
-                    content=err_text.encode("utf-8"),
-                    status_code=resp.status_code,
-                    media_type="application/json",
-                    headers={
-                        **upstream_headers,
+
+            out_headers = _stream_headers(
+                _upstream_response_headers(
+                    resp,
+                    {
+                        "content-type": out_ct or "text/event-stream",
                         "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
                         "x-switch-codex-pool": _header_safe(umodel),
                         "x-switch-codex-route-pool": _header_safe(route_pool),
                         "x-switch-codex-active-model": _header_safe(active),
                     },
                 )
+            )
+            if client_model is not None:
+                out_headers["x-switch-codex-client-model"] = _header_safe(client_model)
+            return StreamingResponse(
+                stream_passthrough(),
+                status_code=resp.status_code,
+                headers=out_headers,
+                media_type=out_ct or "text/event-stream",
+            )
 
-            # 首选上游重试耗尽后仍失败：后台重级联，请求改走剩余候选，不阻塞 30s 探测。
-            if is_preferred:
-                cascaded_once = True
-                log.info(
-                    "re-cascade after failover model=%s failed=%s exclude=%s",
-                    client_model,
-                    upstream.get("name"),
-                    list(failed_ids),
-                )
-                await _kick_recascade(client_model, failed_ids, timeout)
-                candidates = core.order_candidates_for_model(
-                    client_model, route_pool, exclude_ids=set(failed_ids)
-                )
-                prefer_name = candidates[0].get("name") if candidates else None
-                idx = 0
-            else:
-                idx += 1
+        # 非流式：读 body 透传 + 提取 usage。
+        upstream_headers = _upstream_response_headers(resp)
+        raw = await resp.aread()
+        await resp.aclose()
+        usage = logbook._extract_usage(raw)
+        if client_model:
+            probes._set_model_availability(
+                str(client_model),
+                _live_ok_payload(str(client_model), route_pool, upstream, resp.status_code),
+            )
+        record(
+            status=resp.status_code,
+            upstream=upstream.get("name"),
+            url=upstream_url,
+            multiplier=core.upstream_multiplier_value(upstream),
+            attempts=list(errors) if errors else None,
+            usage=usage,
+            duration_ms=(time.perf_counter() - t0) * 1000.0,
+            ttft_ms=arrived_ms,
+            upstream_id=upstream.get("id"),
+        )
         await client.aclose()
-    except Exception as e:
-        await client.aclose()
-        eid = record_error(status=None, error=f"proxy exception: {e}", attempts=list(errors))
-        record(status=None, error_log_id=eid, attempts=list(errors) if errors else None)
-        raise
+        return Response(
+            content=raw,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type", "application/json"),
+            headers={
+                **upstream_headers,
+                "content-type": resp.headers.get("content-type", "application/json"),
+                "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
+                "x-switch-codex-pool": _header_safe(umodel),
+                "x-switch-codex-route-pool": _header_safe(route_pool),
+                "x-switch-codex-active-model": _header_safe(active),
+            },
+        )
 
-    # 全部上游失败：优先透传第一个可用 4xx，否则 502，错误体用 Anthropic 格式。
-    final_status = 502
-    first_4xx = next(
-        (
-            a.get("status")
-            for a in errors
-            if isinstance(a.get("status"), int) and 400 <= a["status"] < 500
-        ),
-        None,
+    # 上游错误（>=400）：如实返回（Anthropic 原生上游错误体本身就是 Anthropic 格式）。
+    upstream_headers = _upstream_response_headers(resp)
+    err_text = (await resp.aread()).decode("utf-8", errors="replace")
+    await resp.aclose()
+    log.warning(
+        "upstream=%s status=%s body=%s",
+        upstream.get("name"),
+        resp.status_code,
+        err_text[:300],
     )
-    if first_4xx is not None:
-        final_status = first_4xx
+    probes.mark_model_upstream_failed(
+        client_model, upstream, status=resp.status_code, error=err_text[:500]
+    )
+    errors.append(
+        {
+            "upstream": upstream.get("name"),
+            "pool": umodel,
+            "priority": int(upstream.get("priority", 100)),
+            "multiplier": core.upstream_multiplier_value(upstream),
+            "url": upstream_url,
+            "status": resp.status_code,
+            "error": err_text[:ERROR_LOG_ATTEMPT_BODY_MAX],
+            "failover": False,
+        }
+    )
     eid = record_error(
-        status=final_status,
-        error="all upstreams failed: " + json.dumps(errors, ensure_ascii=False)[:1000],
+        status=resp.status_code,
+        error=err_text[:500],
         attempts=list(errors),
     )
     record(
-        status=final_status,
+        status=resp.status_code,
+        upstream=upstream.get("name"),
+        url=upstream_url,
+        multiplier=core.upstream_multiplier_value(upstream),
         error_log_id=eid,
         attempts=list(errors) if errors else None,
     )
-    return JSONResponse(
-        status_code=final_status,
-        content=anthropic.anthropic_error_response(
-            final_status,
-            f"All upstreams failed for client_model={client_model!r} "
-            f"route_pool={route_pool} active_model={active}",
-        ),
+    await client.aclose()
+    return Response(
+        content=err_text,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+        headers={
+            **upstream_headers,
+            "x-switch-codex-upstream": _header_safe(upstream.get("name", "")),
+            "x-switch-codex-pool": _header_safe(umodel),
+            "x-switch-codex-route-pool": _header_safe(route_pool),
+            "x-switch-codex-active-model": _header_safe(active),
+        },
     )
