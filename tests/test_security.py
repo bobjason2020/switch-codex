@@ -8,7 +8,7 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 from sy.auth import _keys_equal, login_client_ip
-from sy.logbook import _extract_reasoning_effort, _extract_session_id
+from sy.logbook import _extract_reasoning_effort, _extract_session_context, _extract_session_id
 from sy.proxy import _safe_responses_path
 from sy.core import upstream_supports_standalone_web_search
 
@@ -104,6 +104,48 @@ class GrokSessionAndEffortTests(unittest.TestCase):
 
     def test_reasoning_summary_only_is_not_effort(self):
         self.assertIsNone(_extract_reasoning_effort({"reasoning": {"summary": "concise"}}))
+
+    def test_codex_subagent_context_keeps_root_and_child(self):
+        import json
+
+        context = _extract_session_context(
+            {
+                "x-codex-turn-metadata": json.dumps(
+                    {
+                        "session_id": "root",
+                        "thread_id": "child",
+                        "parent_thread_id": "root",
+                        "root_thread_id": "root",
+                        "thread_source": "subagent",
+                    }
+                )
+            },
+            {},
+        )
+        self.assertEqual(context["session_id"], "root")
+        self.assertEqual(context["thread_id"], "child")
+        self.assertEqual(context["cache_session_id"], "child")
+        self.assertEqual(context["session_path"], ["root", "child"])
+
+    def test_codex_nested_subagent_context_preserves_chain(self):
+        import json
+
+        context = _extract_session_context(
+            {
+                "x-codex-turn-metadata": json.dumps(
+                    {
+                        "session_id": "root",
+                        "thread_id": "leaf",
+                        "parent_thread_id": "middle",
+                        "root_thread_id": "root",
+                        "thread_source": "subagent",
+                    }
+                )
+            },
+            {},
+        )
+        self.assertEqual(context["session_path"], ["root", "middle", "leaf"])
+        self.assertEqual(context["cache_session_id"], "leaf")
 
 
 if __name__ == "__main__":

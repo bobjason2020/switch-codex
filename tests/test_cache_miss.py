@@ -66,6 +66,23 @@ class AnnotateCacheMissTests(unittest.TestCase):
         # 长文本档差额 10 - 1.0 = 9.0
         self.assertAlmostEqual(items[1]["cache_miss_extra_usd"], 290304 * 9.0 / 1e6, places=6)
 
+    def test_subagent_cache_context_isolated_from_parent(self):
+        parent = ent("root", "2026-08-25T10:00:00+08:00", 300000, 293120)
+        child = ent("root", "2026-08-25T10:01:00+08:00", 300500, 2816)
+        child["thread_id"] = "child"
+        child["cache_session_id"] = "child"
+        logbook._annotate_cache_misses([parent, child])
+        self.assertFalse(child["is_cache_miss"])
+
+    def test_same_subagent_thread_cache_drop_is_marked(self):
+        first = ent("root", "2026-08-25T10:00:00+08:00", 300000, 293120)
+        second = ent("root", "2026-08-25T10:01:00+08:00", 300500, 2816)
+        for item in (first, second):
+            item["thread_id"] = "child"
+            item["cache_session_id"] = "child"
+        logbook._annotate_cache_misses([first, second])
+        self.assertTrue(second["is_cache_miss"])
+
     def test_standard_tier_uses_base_price_diff(self):
         items = [
             ent("S", "2026-08-25T10:00:00+08:00", 200000, 180000),
@@ -84,6 +101,27 @@ class AnnotateCacheMissTests(unittest.TestCase):
         ]
         logbook._annotate_cache_misses(items)
         self.assertFalse(items[1]["is_cache_miss"])
+
+    def test_small_input_shrink_with_cache_reset_is_marked(self):
+        # 客户端重算可能让输入少几个 token，但缓存前缀仍应连续比较。
+        items = [
+            ent("S", "2026-08-25T10:00:00+08:00", 79535, 67328),
+            ent("S", "2026-08-25T10:01:00+08:00", 79493, 14080),
+        ]
+        logbook._annotate_cache_misses(items)
+        self.assertTrue(items[1]["is_cache_miss"])
+        self.assertEqual(items[1]["cache_miss_tokens"], 53248)
+        self.assertEqual(items[1]["cache_miss_type"], "prefix_reset")
+
+    def test_material_input_shrink_is_not_cache_miss(self):
+        # 输入明显缩短是上下文收缩/重建，不应计入掉缓存。
+        items = [
+            ent("S", "2026-08-25T10:00:00+08:00", 171205, 169728),
+            ent("S", "2026-08-25T10:01:00+08:00", 166281, 14080),
+        ]
+        logbook._annotate_cache_misses(items)
+        self.assertFalse(items[1]["is_cache_miss"])
+        self.assertIsNone(items[1]["cache_miss_type"])
 
     def test_cache_grew_not_marked(self):
         items = [

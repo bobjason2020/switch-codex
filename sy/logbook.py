@@ -21,6 +21,8 @@ from sy import core, db, timeutil
 from sy.const import (
     AVAIL_HISTORY_RETENTION_DAYS,
     CACHE_MISS_MAX_GAP_SEC,
+    CACHE_MISS_INPUT_SHRINK_TOLERANCE_TOKENS,
+    CACHE_MISS_RULE_VERSION,
     COLOR_MID,
     COLOR_BAD,
     ERROR_LOG_BODY_MAX_BYTES,
@@ -202,6 +204,99 @@ def _extract_session_id(headers: dict[str, str], body: dict) -> Optional[str]:
     return None
 
 
+def _extract_session_context(headers: dict[str, str], body: dict) -> dict[str, Any]:
+    """Extract the root session and Codex thread ancestry from a request.
+
+    Codex keeps ``session_id`` stable across a delegated subagent, while the
+    turn metadata carries the child ``thread_id`` and its parent.  Keep both
+    identities so display can show the ancestry and cache accounting can use
+    the most specific thread.
+    """
+    normalized = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+    metadata: dict[str, Any] = {}
+    raw = normalized.get("x-codex-turn-metadata")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                metadata = parsed
+        except (TypeError, ValueError):
+            pass
+    if isinstance(body, dict):
+        body_metadata = body.get("metadata")
+        if isinstance(body_metadata, dict):
+            for key, value in body_metadata.items():
+                metadata.setdefault(key, value)
+        for key in (
+            "thread_id",
+            "parent_thread_id",
+            "root_thread_id",
+            "forked_from_thread_id",
+            "thread_source",
+            "subagent_kind",
+            "agent_name",
+        ):
+            if key in body and key not in metadata:
+                metadata[key] = body[key]
+
+    def pick_string(*keys: str) -> Optional[str]:
+        for key in keys:
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            value = normalized.get(key.lower())
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    session_id = _extract_session_id(normalized, body)
+    # The turn metadata is also accepted as a fallback for Codex clients that
+    # omit the legacy session header.
+    if not session_id:
+        session_id = pick_string("session_id", "root_thread_id")
+    thread_id = pick_string("thread_id", "x-codex-thread-id")
+    parent_thread_id = pick_string(
+        "parent_thread_id", "forked_from_thread_id", "x-codex-parent-thread-id"
+    )
+    root_thread_id = pick_string("root_thread_id") or session_id
+    thread_source = pick_string("thread_source")
+    subagent_kind = pick_string("subagent_kind")
+    agent_name = pick_string("agent_name")
+
+    is_subagent = bool(
+        thread_id
+        and (
+            thread_source == "subagent"
+            or bool(subagent_kind)
+            or (parent_thread_id and parent_thread_id != thread_id)
+            or (root_thread_id and root_thread_id != thread_id and thread_id != session_id)
+        )
+    )
+    if not thread_id and is_subagent:
+        thread_id = parent_thread_id
+    cache_session_id = thread_id if is_subagent and thread_id else session_id
+
+    # Build a compact root -> parent -> current chain, deduplicating repeated
+    # root IDs used by first-level subagents.
+    chain: list[str] = []
+    for value in (root_thread_id or session_id, parent_thread_id, thread_id):
+        if value and value not in chain:
+            chain.append(value)
+    if not chain and session_id:
+        chain.append(session_id)
+    return {
+        "session_id": session_id,
+        "thread_id": thread_id,
+        "parent_thread_id": parent_thread_id,
+        "root_thread_id": root_thread_id,
+        "thread_source": thread_source,
+        "subagent_kind": subagent_kind,
+        "agent_name": agent_name,
+        "cache_session_id": cache_session_id,
+        "session_path": chain,
+    }
+
+
 def _extract_reasoning_effort(body: dict) -> Optional[str]:
     """Responses / Chat 请求里的思考强度。"""
     if not isinstance(body, dict):
@@ -314,6 +409,14 @@ def _record_log(**fields: Any) -> None:
         "path": path,
         "endpoint": endpoint,
         "session_id": fields.pop("session_id", None),
+        "thread_id": fields.pop("thread_id", None),
+        "parent_thread_id": fields.pop("parent_thread_id", None),
+        "root_thread_id": fields.pop("root_thread_id", None),
+        "thread_source": fields.pop("thread_source", None),
+        "subagent_kind": fields.pop("subagent_kind", None),
+        "agent_name": fields.pop("agent_name", None),
+        "cache_session_id": fields.pop("cache_session_id", None),
+        "session_path": fields.pop("session_path", None),
         "pool": fields.pop("pool", ""),
         "client_model": fields.pop("client_model", None),
         "reasoning_effort": fields.pop("reasoning_effort", None),
@@ -413,9 +516,9 @@ def _cache_miss_extra_usd(entry: dict, lost_tokens: int) -> float:
 
 
 def _mark_cache_miss(entry: dict, prev: tuple[str, Optional[int], Optional[int]]) -> None:
-    """按同 (session_id, upstream) 前驱判定本条是否掉缓存,命中则就地标记。
+    """按同 (cache_session_id, upstream) 前驱判定本条是否掉缓存,命中则就地标记。
 
-    prev = (ts, cache_read_tokens, input_tokens),为同会话同上游上一条带 usage 的记录。
+    prev = (ts, cache_read_tokens, input_tokens),为同缓存线程同上游上一条带 usage 的记录。
     只标记成功请求(status 2xx/3xx),保证「掉缓存 ⊆ 成功」。
     """
     if not _is_success_status(entry.get("status")):
@@ -423,15 +526,34 @@ def _mark_cache_miss(entry: dict, prev: tuple[str, Optional[int], Optional[int]]
     prev_ts, prev_cr, prev_in = prev
     if prev_cr is None or prev_in is None:
         return
-    if entry["cache_read_tokens"] < prev_cr and entry["input_tokens"] >= prev_in:
+    # 小幅输入回退通常来自客户端重算/分块边界，不代表上下文被截断。
+    # 只有明显缩短才跳过，避免把上下文收缩误报成掉缓存。
+    input_delta = entry["input_tokens"] - prev_in
+    if (
+        entry["cache_read_tokens"] < prev_cr
+        and input_delta >= -CACHE_MISS_INPUT_SHRINK_TOLERANCE_TOKENS
+    ):
         lost = max(min(prev_cr, entry["input_tokens"]) - entry["cache_read_tokens"], 0)
         if lost > 0:
             entry["is_cache_miss"] = True
             entry["cache_miss_tokens"] = lost
+            entry["cache_miss_type"] = "prefix_reset"
             entry["cache_miss_extra_usd"] = _cache_miss_extra_usd(entry, lost)
 
 
-# 写路径增量判定用的同会话前驱状态。状态采用 LRU + TTL，避免高基数 session
+def _cache_session_id(entry: dict) -> Optional[str]:
+    """Return the most specific cache context, with legacy-log fallback."""
+    value = entry.get("cache_session_id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    thread_id = entry.get("thread_id")
+    if isinstance(thread_id, str) and thread_id.strip():
+        return thread_id.strip()
+    session_id = entry.get("session_id")
+    return session_id.strip() if isinstance(session_id, str) and session_id.strip() else None
+
+
+# 写路径增量判定用的同缓存线程前驱状态。状态采用 LRU + TTL，避免高基数 session
 # 长期运行时无限增长；None 表示已从库补种但没有可比较前驱。
 _last_usage_state: OrderedDict[
     tuple[str, str], tuple[float, Optional[tuple[str, Optional[int], Optional[int]]]]
@@ -451,7 +573,9 @@ def _attach_cache_miss_fields(entry: dict) -> None:
     entry["is_cache_miss"] = False
     entry["cache_miss_tokens"] = 0
     entry["cache_miss_extra_usd"] = 0.0
-    sid = entry.get("session_id")
+    entry["cache_miss_type"] = None
+    entry["cache_miss_rule_version"] = CACHE_MISS_RULE_VERSION
+    sid = _cache_session_id(entry)
     if not sid or entry.get("cache_read_tokens") is None or entry.get("input_tokens") is None:
         return
     key = (str(sid), str(entry.get("upstream") or ""))
@@ -483,10 +607,11 @@ def _annotate_cache_misses(
 ) -> None:
     """就地给每条日志附加掉缓存标记(一次性回填 / 测试用)。
 
-    同一 (session_id, upstream) 内按时间升序比较:本条 cache_read < 上一条
-    (同会话同上游、有 usage)的 cache_read,且本条 input_tokens >= 上一条
-    input_tokens,且相邻间隔 <= max_gap_sec → 判为掉缓存。间隔超过上限视为
-    缓存自然过期,不计。缓存按上游隔离,跨上游的同会话请求不可比。
+    同一 (cache_session_id, upstream) 内按时间升序比较:本条 cache_read < 上一条
+    (同会话同上游、有 usage)的 cache_read,且本条 input_tokens 不比上一条少
+    超过 CACHE_MISS_INPUT_SHRINK_TOLERANCE_TOKENS,且相邻间隔 <= max_gap_sec
+    → 判为掉缓存。输入明显缩短视为上下文收缩；间隔超过上限视为缓存自然
+    过期,两者都不计为掉缓存。缓存按上游隔离,跨上游的同会话请求不可比。
     只标记成功请求(status 2xx/3xx),保证「掉缓存 ⊆ 成功」。
     附加字段:is_cache_miss / cache_miss_tokens(丢失缓存 token,>=0) /
     cache_miss_extra_usd(= 丢失缓存 × (输入价 − 缓存读价) / 1M,按本条档位计价)。
@@ -495,9 +620,11 @@ def _annotate_cache_misses(
         e["is_cache_miss"] = False
         e["cache_miss_tokens"] = 0
         e["cache_miss_extra_usd"] = 0.0
+        e["cache_miss_type"] = None
+        e["cache_miss_rule_version"] = CACHE_MISS_RULE_VERSION
     groups: dict[tuple[str, str], list[dict]] = {}
     for e in items:
-        sid = e.get("session_id")
+        sid = _cache_session_id(e)
         if sid:
             key = (str(sid), str(e.get("upstream") or ""))
             groups.setdefault(key, []).append(e)
@@ -519,7 +646,13 @@ def _backfill_cache_miss_fields() -> int:
     try:
         if not any(
             db.has_request_logs_missing_field(field)
-            for field in ("is_cache_miss", "cache_miss_tokens", "cache_miss_extra_usd")
+            for field in (
+                "is_cache_miss",
+                "cache_miss_tokens",
+                "cache_miss_extra_usd",
+                "cache_miss_type",
+                "cache_miss_rule_version",
+            )
         ):
             return 0
     except Exception:
@@ -541,14 +674,25 @@ def _backfill_cache_miss_fields() -> int:
         changed: list[tuple[int, dict]] = []
         for seq, entry in pairs:
             last_seq = seq
-            needs_fields = any(
-                field not in entry
-                for field in ("is_cache_miss", "cache_miss_tokens", "cache_miss_extra_usd")
+            needs_fields = (
+                any(
+                    field not in entry
+                    for field in (
+                        "is_cache_miss",
+                        "cache_miss_tokens",
+                        "cache_miss_extra_usd",
+                        "cache_miss_type",
+                        "cache_miss_rule_version",
+                    )
+                )
+                or entry.get("cache_miss_rule_version") != CACHE_MISS_RULE_VERSION
             )
             entry["is_cache_miss"] = False
             entry["cache_miss_tokens"] = 0
             entry["cache_miss_extra_usd"] = 0.0
-            sid = entry.get("session_id")
+            entry["cache_miss_type"] = None
+            entry["cache_miss_rule_version"] = CACHE_MISS_RULE_VERSION
+            sid = _cache_session_id(entry)
             if sid and entry.get("cache_read_tokens") is not None and entry.get("input_tokens") is not None:
                 key = (str(sid), str(entry.get("upstream") or ""))
                 prev = state.pop(key, None)
@@ -864,9 +1008,10 @@ def _aggregate_stats(items: list[dict], now: datetime) -> dict:
                 cost_by_upstream_cny[upstream] = (
                     cost_by_upstream_cny.get(upstream, 0.0) + real_cost
                 )
-        # 可判定掉缓存的请求:有 session 且有 usage(缓存/输入数据齐全)
+        # 可判定掉缓存的请求:有 session 且有 usage(缓存/输入数据齐全)。
+        # 具体比较键由 cache_session_id 隔离，避免 subagent 污染父会话。
         if (
-            e.get("session_id")
+            _cache_session_id(e)
             and e.get("cache_read_tokens") is not None
             and e.get("input_tokens") is not None
         ):

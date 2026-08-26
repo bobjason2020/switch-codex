@@ -394,7 +394,7 @@ async def proxy_responses(
                 reasoning_effort = logbook._extract_reasoning_effort(j)
         except Exception:
             pass
-    session_id = logbook._extract_session_id(
+    session_context = logbook._extract_session_context(
         {k.lower(): v for k, v in request.headers.items()}, j
     )
 
@@ -416,7 +416,7 @@ async def proxy_responses(
             method=method,
             path=log_path,
             endpoint=endpoint,
-            session_id=session_id,
+            **session_context,
             pool=core.resolve_route_pool(client_model, active),
             client_model=client_model,
             reasoning_effort=reasoning_effort,
@@ -775,7 +775,7 @@ async def proxy_anthropic_messages(
         _j = {}
     if not isinstance(_j, dict):
         _j = {}
-    session_id = logbook._extract_session_id(
+    session_context = logbook._extract_session_context(
         {k.lower(): v for k, v in request.headers.items()}, _j
     )
     client_model = None
@@ -801,7 +801,7 @@ async def proxy_anthropic_messages(
             client_ip=client_ip,
             method=method,
             path=log_path,
-            session_id=session_id,
+            **session_context,
             pool=core.resolve_route_pool(client_model, active),
             client_model=client_model,
             reasoning_effort=reasoning_effort,

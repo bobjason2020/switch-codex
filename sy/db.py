@@ -487,7 +487,7 @@ def load_request_logs_range(
 
 
 def load_last_usage_entry(session_id: str, upstream: str) -> Optional[dict]:
-    """返回同 (session_id, upstream) 最近一条带 usage(cache_read/input 齐全)的日志。
+    """返回同 (cache_session_id, upstream) 最近一条带 usage 的日志。
 
     供写路径增量判定掉缓存时补种前驱状态；无则返回 None。
     """
@@ -495,12 +495,14 @@ def load_last_usage_entry(session_id: str, upstream: str) -> Optional[dict]:
         conn = _get_conn()
         row = conn.execute(
             "SELECT payload FROM request_logs "
-            "WHERE json_extract(payload, '$.session_id') = ? "
+            "WHERE (json_extract(payload, '$.cache_session_id') = ? "
+            "OR (json_extract(payload, '$.cache_session_id') IS NULL "
+            "AND json_extract(payload, '$.session_id') = ?)) "
             "AND upstream = ? "
             "AND json_extract(payload, '$.cache_read_tokens') IS NOT NULL "
             "AND json_extract(payload, '$.input_tokens') IS NOT NULL "
             "ORDER BY seq DESC LIMIT 1",
-            (str(session_id), str(upstream)),
+            (str(session_id), str(session_id), str(upstream)),
         ).fetchone()
     return _decode(row["payload"]) if row is not None else None
 
@@ -511,6 +513,8 @@ def has_request_logs_missing_field(field: str) -> bool:
         "is_cache_miss": "$.is_cache_miss",
         "cache_miss_tokens": "$.cache_miss_tokens",
         "cache_miss_extra_usd": "$.cache_miss_extra_usd",
+        "cache_miss_type": "$.cache_miss_type",
+        "cache_miss_rule_version": "$.cache_miss_rule_version",
         "multiplier": "$.multiplier",
     }
     path = paths.get(str(field))
