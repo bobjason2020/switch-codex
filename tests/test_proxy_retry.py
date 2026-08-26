@@ -17,11 +17,21 @@ from sy.proxy import (
     _forward_request_headers,
     _read_request_body_limited,
     _read_upstream_body_limited,
+    _stream_usage_is_empty,
     _upstream_response_headers,
 )
 
 
 class HeaderForwardingTests(unittest.TestCase):
+    def test_empty_stream_usage_requires_positive_total(self):
+        self.assertTrue(_stream_usage_is_empty(None))
+        self.assertTrue(
+            _stream_usage_is_empty({"input_tokens": 0, "output_tokens": 0})
+        )
+        self.assertFalse(
+            _stream_usage_is_empty({"input_tokens": 3, "output_tokens": 2})
+        )
+
     def test_preserves_codex_metadata_and_custom_headers(self):
         headers = _forward_request_headers(
             {

@@ -261,6 +261,12 @@ class _UsageSink:
         self.feed_obj(obj)
 
 
+def _stream_usage_is_empty(usage: Optional[dict]) -> bool:
+    """Whether a completed Responses stream has no billable token usage."""
+    total_tokens = logbook._usage_numbers(usage).get("total_tokens")
+    return total_tokens is None or total_tokens <= 0
+
+
 def _sse_error_bytes(message: str) -> bytes:
     payload = json.dumps(
         {"type": "error", "error": {"type": "api_error", "message": message}},
@@ -436,6 +442,10 @@ async def proxy_responses(
         ttft_ms: Optional[float] = None,
         endpoint: Optional[str] = None,
         upstream_id: Optional[str] = None,
+        stream_completed: Optional[bool] = None,
+        stream_error: Optional[str] = None,
+        client_disconnect: Optional[bool] = None,
+        downstream_started: Optional[bool] = None,
     ) -> None:
         logbook._record_log(
             client_ip=client_ip,
@@ -460,6 +470,10 @@ async def proxy_responses(
             error_log_id=error_log_id,
             attempts=attempts,
             stream=stream,
+            stream_completed=stream_completed,
+            stream_error=stream_error,
+            client_disconnect=client_disconnect,
+            downstream_started=downstream_started,
             **logbook._usage_numbers(usage),
         )
 
@@ -630,7 +644,33 @@ async def proxy_responses(
                             error=stream_error,
                             attempts=list(errors),
                         )
-                    if stream_error is None and not client_disconnect and client_model:
+                    empty_usage_error = None
+                    if (
+                        stream_error is None
+                        and not client_disconnect
+                        and responses_route
+                        and stream
+                        and _stream_usage_is_empty(sink.usage)
+                    ):
+                        empty_usage_error = (
+                            "upstream Responses stream completed without token usage"
+                        )
+                        stream_err_log_id = record_error(
+                            status=502,
+                            error=empty_usage_error,
+                            attempts=list(errors),
+                        )
+                        log.warning(
+                            "empty Responses stream upstream=%s pool=%s",
+                            up.get("name"),
+                            route_pool,
+                        )
+                    if (
+                        stream_error is None
+                        and empty_usage_error is None
+                        and not client_disconnect
+                        and client_model
+                    ):
                         probes._set_model_availability(
                             str(client_model),
                             _live_ok_payload(
@@ -638,7 +678,7 @@ async def proxy_responses(
                             ),
                         )
                     record(
-                        status=r.status_code,
+                        status=502 if empty_usage_error else r.status_code,
                         upstream=up.get("name"),
                         url=uurl,
                         multiplier=core.upstream_multiplier_value(up),
@@ -649,6 +689,10 @@ async def proxy_responses(
                         ttft_ms=first_ms if first_ms is not None else arrived,
                         endpoint=("search" if standalone_search else None),
                         upstream_id=up.get("id"),
+                        stream_completed=stream_error is None and not client_disconnect,
+                        stream_error=stream_error or empty_usage_error,
+                        client_disconnect=client_disconnect,
+                        downstream_started=first_ms is not None,
                     )
 
             out_headers = _stream_headers(
