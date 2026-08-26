@@ -137,7 +137,7 @@ def _load_manifest() -> dict:
 
 
 def _save_manifest(data: dict) -> None:
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    _secure_mkdir(BACKUP_DIR)
     MANIFEST.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     MANIFEST.chmod(0o600)
 
@@ -183,13 +183,30 @@ def _read_json(path: Path, default: Any) -> Any:
 def _copy_file_if_exists(src: Path, dst: Path) -> bool:
     if not src.exists():
         return False
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    _secure_mkdir(dst.parent)
     shutil.copy2(src, dst)
     try:
         dst.chmod(0o600)
     except OSError:
         pass
     return True
+
+
+def _secure_mkdir(path: Path) -> None:
+    """Create a directory used for credentials or client-configuration snapshots."""
+    data_root = DATA.resolve()
+    directory = path.resolve()
+    if data_root not in directory.parents and directory != data_root:
+        raise ValueError(f"snapshot directory must be below {DATA}: {path}")
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    while True:
+        try:
+            directory.chmod(0o700)
+        except OSError:
+            pass
+        if directory == data_root:
+            break
+        directory = directory.parent
 
 
 def _router_master_key() -> str:
@@ -238,7 +255,7 @@ def ensure_original_snapshot() -> dict:
     auth = auth_path()
     info["original_auth_existed"] = auth.exists()
 
-    ORIGINAL_DIR.mkdir(parents=True, exist_ok=True)
+    _secure_mkdir(ORIGINAL_DIR)
     if src_cfg:
         _copy_file_if_exists(src_cfg, ORIGINAL_DIR / "config.toml")
     if src_models:
@@ -257,7 +274,7 @@ def _save_openai_snapshot_if_needed() -> None:
     """离开 openai-all 前保存当前状态，切回时能还原 openai 期间的修改。"""
     if _load_manifest().get("mode") != "openai-all":
         return
-    OPENAI_SNAP_DIR.mkdir(parents=True, exist_ok=True)
+    _secure_mkdir(OPENAI_SNAP_DIR)
     info = {
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "config_existed": config_path().exists(),

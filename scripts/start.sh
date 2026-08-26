@@ -15,6 +15,9 @@ VENV="$ROOT/.venv"
 LOG="$ROOT/logs/switchyard.tmux.log"
 FORCE="${SR_FORCE:-0}"
 mkdir -p "$ROOT/logs"
+# SQLite data, exports, and client-configuration snapshots can contain API keys.
+mkdir -p -m 700 "$ROOT/data"
+chmod 700 "$ROOT/data"
 
 if [[ ! -x "$VENV/bin/uvicorn" ]]; then
   echo "installing deps..."

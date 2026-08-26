@@ -32,12 +32,16 @@ def main() -> int:
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     backup = DB.with_name(f"{DB.name}.bak-499-{stamp}")
+    backup.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    backup.parent.chmod(0o700)
+    backup.touch(mode=0o600, exist_ok=False)
     src = sqlite3.connect(DB)
     dst = sqlite3.connect(backup)
     with dst:
         src.backup(dst)
     dst.close()
     src.close()
+    backup.chmod(0o600)
     print(f"backup: {backup}")
 
     conn = sqlite3.connect(DB)

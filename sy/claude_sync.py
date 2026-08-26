@@ -28,7 +28,13 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
 
-from sy.codex_sync import _atomic_write, _read_text_file, _router_master_key, is_deepseek_model
+from sy.codex_sync import (
+    _atomic_write,
+    _read_text_file,
+    _router_master_key,
+    _secure_mkdir,
+    is_deepseek_model,
+)
 from sy.const import DEEPSEEK_CLIENT_MODELS, provider_base_url
 
 log = logging.getLogger("switchyard.claude_sync")
@@ -102,7 +108,7 @@ def _load_manifest() -> dict:
 
 
 def _save_manifest(data: dict) -> None:
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    _secure_mkdir(BACKUP_DIR)
     MANIFEST.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     MANIFEST.chmod(0o600)
 
@@ -110,7 +116,7 @@ def _save_manifest(data: dict) -> None:
 def _copy_file_if_exists(src: Path, dst: Path) -> bool:
     if not src.exists():
         return False
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    _secure_mkdir(dst.parent)
     shutil.copy2(src, dst)
     try:
         dst.chmod(0o600)
@@ -290,7 +296,7 @@ def ensure_original_snapshot() -> dict:
         "claude_home": str(claude_home()),
         "original_settings_existed": sp.exists(),
     }
-    ORIGINAL_DIR.mkdir(parents=True, exist_ok=True)
+    _secure_mkdir(ORIGINAL_DIR)
     if sp.exists():
         _copy_file_if_exists(sp, ORIGINAL_DIR / "settings.json")
     ORIGINAL_MANIFEST.write_text(
