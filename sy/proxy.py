@@ -174,13 +174,11 @@ def _is_public_request(request: Request, trust_proxy_headers: bool = False) -> b
 _SAFE_PATH_SEG = __import__("re").compile(r"^[A-Za-z0-9._~-]+$")
 
 
-def _safe_responses_path(path: str, method: str) -> str:
-    """Sanitize /v1/responses/{path}；拒绝穿越。POST 只允许集合本身。"""
+def _safe_responses_path(path: str, method: str = "") -> str:
+    """Sanitize any /v1/responses suffix before opaque upstream passthrough."""
     raw = (path or "").strip().strip("/")
     if not raw:
         return "responses"
-    if method == "POST":
-        raise HTTPException(status_code=405, detail="POST not allowed on nested responses path")
     if ".." in raw or "\\" in raw or raw.startswith("/"):
         raise HTTPException(status_code=400, detail="invalid path")
     parts = [p for p in raw.split("/") if p]
@@ -360,8 +358,14 @@ async def _forward_once(
 
 
 @router.api_route("/v1/alpha/search", methods=["POST"])
-@router.api_route("/v1/responses", methods=["POST"])
-@router.api_route("/v1/responses/{path:path}", methods=["GET", "POST", "DELETE"])
+@router.api_route(
+    "/v1/responses",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+@router.api_route(
+    "/v1/responses/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
 async def proxy_responses(
     request: Request,
     path: str = "",

@@ -53,10 +53,9 @@ class ResponsesPathTests(unittest.TestCase):
         self.assertEqual(_safe_responses_path("", "POST"), "responses")
         self.assertEqual(_safe_responses_path("/", "GET"), "responses")
 
-    def test_reject_nested_post(self):
-        with self.assertRaises(HTTPException) as ctx:
-            _safe_responses_path("abc", "POST")
-        self.assertEqual(ctx.exception.status_code, 405)
+    def test_accept_nested_post_for_compaction_and_other_endpoints(self):
+        self.assertEqual(_safe_responses_path("compact", "POST"), "responses/compact")
+        self.assertEqual(_safe_responses_path("abc", "POST"), "responses/abc")
 
     def test_reject_traversal(self):
         with self.assertRaises(HTTPException) as ctx:

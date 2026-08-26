@@ -222,8 +222,7 @@ static/
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/v1/responses` | OpenAI Responses 代理端点 |
-| GET / POST / DELETE | `/v1/responses/{id}` | OpenAI Responses 对象操作，方法和路径原样转发 |
+| GET / POST / PUT / PATCH / DELETE / OPTIONS | `/v1/responses[/{path}]` | OpenAI Responses 及 Compaction 等端点原样透传 |
 | POST | `/v1/alpha/search` | Codex 独立 Web Search 代理端点，仅路由到兼容的 OpenAI Responses 上游 |
 | GET / POST / PUT / PATCH / DELETE / OPTIONS | `/v1/{path}` | 其它 `/v1/*` 路径原样透传到选定上游（例如 `/v1/models`、`/v1/embeddings`） |
 | PUT | `/api/active-model` | `{"active_model":"..."}` 切换池 + 同步 Codex |
