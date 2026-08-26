@@ -8,6 +8,24 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Git Bash / MSYS / Cygwin run on native Windows, where tmux and /proc-based
+# process management are unavailable. Hand off to the PowerShell launcher.
+case "$(uname -s 2>/dev/null || true)" in
+  MINGW*|MSYS*|CYGWIN*)
+    if ! command -v powershell.exe >/dev/null 2>&1; then
+      echo "Windows detected, but powershell.exe is unavailable" >&2
+      exit 1
+    fi
+    if command -v cygpath >/dev/null 2>&1; then
+      WINDOWS_START_SCRIPT="$(cygpath -w "$ROOT/scripts/start.ps1")"
+    else
+      WINDOWS_START_SCRIPT="$ROOT/scripts/start.ps1"
+    fi
+    exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$WINDOWS_START_SCRIPT"
+    ;;
+esac
+
 SESSION="${SR_TMUX_SESSION:-switchyard}"
 HOST="${SW_HOST:-127.0.0.1}"
 PORT="${SW_PORT:-${SR_PORT:-4100}}"

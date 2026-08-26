@@ -4,6 +4,36 @@ OpenAI **Responses** 风格的多上游 API 路由代理 + 管理 UI，并按 De
 
 中文名「Codex 调度站」：请求按模型池调度到一个上游并原样转发。当前版本不做自动故障切换、重试、协议转换或请求模型改写；选中的上游失败时，客户端收到该次失败结果。
 
+## 极简部署
+
+只想先部署、启动并打开 Web 管理界面时，克隆项目后按系统执行启动命令：
+
+macOS / Linux（需要 `python3`、`tmux` 和 `curl`）：
+
+```bash
+git clone https://github.com/bobjason2020/switch-codex.git
+cd switch-codex
+./scripts/start.sh
+```
+
+Windows（需要安装 Python 3；服务会直接在后台运行，不需要 `tmux`）：
+
+```powershell
+git clone https://github.com/bobjason2020/switch-codex.git
+cd switch-codex
+.\scripts\start.cmd
+```
+
+也可在 Git Bash 中运行 `./scripts/start.sh`，它会自动识别 Windows 并调用后台启动器。首次启动会自动创建 Python 虚拟环境并安装依赖。命令显示 `ready` 后，在部署机器的浏览器打开 [http://127.0.0.1:4100/](http://127.0.0.1:4100/)。Windows 的运行日志位于 `logs/switchyard.windows.log` 和 `logs/switchyard.windows.error.log`。
+
+部署在远程服务器且需要从自己的电脑打开界面时，以公网监听方式启动：
+
+```bash
+SW_HOST=0.0.0.0 ./scripts/start.sh
+```
+
+然后访问 `http://<服务器 IP 或域名>:4100/`。公网访问的安全设置见下方「运维与公网部署」。
+
 ## 部署与使用
 
 ### 1. 准备环境并启动
