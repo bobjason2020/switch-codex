@@ -8,10 +8,10 @@ from unittest import mock
 from sy import core, db
 from sy.const import CACHE_MISS_MAX_GAP_SEC
 
-# import 时会触发掉缓存字段一次性回填,测试环境不碰真实数据库。
+# import 时会安排后台维护，测试环境不触发真实数据库回填。
 with mock.patch.object(
     db, "has_request_logs_missing_field", return_value=False
-), mock.patch.object(db, "backup_db"), mock.patch.object(db, "replace_request_logs"):
+), mock.patch.object(db, "replace_request_logs"):
     from sy import logbook
 
 SOL = {
