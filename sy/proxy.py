@@ -1,4 +1,4 @@
-"""Switch-codex 代理层：/v1/responses、/v1/alpha/search、/v1/messages 纯透传。
+"""Switch-codex 代理层：/v1/* API 纯透传。
 
 纯透传语义：
 - 不做任何协议转换（去掉 Responses↔Chat、Anthropic↔Responses）。
@@ -189,6 +189,17 @@ def _safe_responses_path(path: str, method: str) -> str:
     return "responses/" + "/".join(parts)
 
 
+def _safe_generic_path(path: str) -> str:
+    """Sanitize a generic /v1/* suffix before appending it to an upstream URL."""
+    raw = (path or "").strip().strip("/")
+    if not raw or ".." in raw or "\\" in raw or raw.startswith("/"):
+        raise HTTPException(status_code=400, detail="invalid path")
+    parts = [part for part in raw.split("/") if part]
+    if not parts or any(not _SAFE_PATH_SEG.fullmatch(part) for part in parts):
+        raise HTTPException(status_code=400, detail="invalid path")
+    return "/".join(parts)
+
+
 class _SseLineBuffer:
     """按完整 UTF-8 行切 SSE，避免 chunk 截断 JSON。"""
 
@@ -315,13 +326,16 @@ async def _forward_once(
     *,
     method: str = "POST",
     anthropic: bool = False,
+    query_string: str = "",
 ) -> httpx.Response:
     """单上游纯透传：body 原样、模型名不改写、无协议转换。
 
     ``anthropic=True`` 用于 /v1/messages（Anthropic Messages 原生），用
-    x-api-key 认证；否则 /v1/responses 与 /v1/alpha/search 用 Bearer。
+    x-api-key 认证；否则其它 /v1/* 透传端点使用 Bearer。
     """
     url = _build_upstream_url(upstream["base_url"], path_suffix)
+    if query_string:
+        url = f"{url}?{query_string}"
     headers = _forward_request_headers(extra_headers)
     headers["content-type"] = content_type or headers.get(
         "content-type", "application/json"
@@ -372,13 +386,21 @@ async def proxy_responses(
     extra = _forward_request_headers(request.headers)
     req_body, req_body_len, req_body_trunc = logbook._request_body_for_log(body)
 
-    standalone_search = request.url.path == "/v1/alpha/search"
-    path_suffix = "alpha/search" if standalone_search else _safe_responses_path(path, method)
-    log_path = (
-        "/v1/alpha/search"
-        if standalone_search
-        else (f"/v1/responses/{path}" if path else "/v1/responses")
+    request_path = request.url.path
+    standalone_search = request_path == "/v1/alpha/search"
+    responses_route = request_path == "/v1/responses" or request_path.startswith(
+        "/v1/responses/"
     )
+    if standalone_search:
+        path_suffix = "alpha/search"
+        log_path = "/v1/alpha/search"
+    elif responses_route:
+        path_suffix = _safe_responses_path(path, method)
+        log_path = f"/v1/responses/{path}" if path else "/v1/responses"
+    else:
+        path_suffix = _safe_generic_path(path)
+        log_path = request_path
+    query_string = request.url.query
 
     # client model + stream（仅用于日志/路由；body 原样透传，不改写）
     client_model = None
@@ -484,7 +506,7 @@ async def proxy_responses(
         candidates = [
             u for u in candidates if core.upstream_supports_standalone_web_search(u)
         ]
-    else:
+    elif responses_route:
         candidates = [u for u in candidates if not u.get("chat_completions")]
     if not candidates:
         # Fall back to active pool if client model maps to an empty pool.
@@ -494,7 +516,7 @@ async def proxy_responses(
             candidates = [
                 u for u in candidates if core.upstream_supports_standalone_web_search(u)
             ]
-        else:
+        elif responses_route:
             candidates = [u for u in candidates if not u.get("chat_completions")]
     if not candidates:
         eid = record_error(status=503, error="no enabled upstreams for route pool")
@@ -522,7 +544,14 @@ async def proxy_responses(
     client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
     try:
         resp = await _forward_once(
-            client, upstream, path_suffix, body, content_type, extra, method=method
+            client,
+            upstream,
+            path_suffix,
+            body,
+            content_type,
+            extra,
+            method=method,
+            query_string=query_string,
         )
     except Exception as e:
         await client.aclose()
@@ -1140,3 +1169,12 @@ async def proxy_anthropic_messages(
             "x-switch-codex-active-model": _header_safe(active),
         },
     )
+
+
+# Keep the protocol-specific routes above first, then accept other OpenAI-style
+# /v1/* paths (for example /v1/models or /v1/embeddings) as opaque passthroughs.
+router.add_api_route(
+    "/v1/{path:path}",
+    proxy_responses,
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)

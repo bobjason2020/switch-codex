@@ -148,7 +148,7 @@ class HeaderForwardingTests(unittest.TestCase):
             seen = []
 
             def handler(request):
-                seen.append(request.method)
+                seen.append((request.method, str(request.url)))
                 return httpx.Response(200, request=request)
 
             client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -166,11 +166,18 @@ class HeaderForwardingTests(unittest.TestCase):
                         "application/json",
                         {},
                         method=method,
+                        query_string="limit=10&after=abc",
                     )
                     await response.aclose()
             finally:
                 await client.aclose()
-            self.assertEqual(seen, ["GET", "DELETE"])
+            self.assertEqual(
+                seen,
+                [
+                    ("GET", "https://upstream.example/v1/responses/resp_123?limit=10&after=abc"),
+                    ("DELETE", "https://upstream.example/v1/responses/resp_123?limit=10&after=abc"),
+                ],
+            )
 
         asyncio.run(run())
 

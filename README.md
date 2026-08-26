@@ -186,7 +186,7 @@ sy/
   logbook.py            # 请求/错误日志、统计、历史可用性时间线
   probes.py             # 模型级联探测 + NewAPI 倍率探测
   auth.py               # 管理登录会话与客户端 key
-  proxy.py              # /v1/responses、/v1/alpha/search、/v1/messages 纯透传
+  proxy.py              # /v1/* 纯透传（含 Responses、Search、Anthropic）
   claude_sync.py        # Claude Code settings.json 快照/恢复
   grok_sync.py          # Grok CLI config.toml 受管段/快照/恢复
   migrate_grok.py       # 一次性 seed grok 池上游（读 ~/.grok/config.toml）
@@ -225,6 +225,7 @@ static/
 | POST | `/v1/responses` | OpenAI Responses 代理端点 |
 | GET / POST / DELETE | `/v1/responses/{id}` | OpenAI Responses 对象操作，方法和路径原样转发 |
 | POST | `/v1/alpha/search` | Codex 独立 Web Search 代理端点，仅路由到兼容的 OpenAI Responses 上游 |
+| GET / POST / PUT / PATCH / DELETE / OPTIONS | `/v1/{path}` | 其它 `/v1/*` 路径原样透传到选定上游（例如 `/v1/models`、`/v1/embeddings`） |
 | PUT | `/api/active-model` | `{"active_model":"..."}` 切换池 + 同步 Codex |
 | GET | `/api/models` | 模型池 + codex_sync 类型 |
 | GET | `/api/config` | 含 codex 状态 |

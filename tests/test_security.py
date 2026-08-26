@@ -9,7 +9,7 @@ from fastapi import HTTPException
 
 from sy.auth import _keys_equal, login_client_ip
 from sy.logbook import _extract_reasoning_effort, _extract_session_context, _extract_session_id
-from sy.proxy import _safe_responses_path
+from sy.proxy import _safe_generic_path, _safe_responses_path
 from sy.core import upstream_supports_standalone_web_search
 
 
@@ -65,6 +65,18 @@ class ResponsesPathTests(unittest.TestCase):
 
     def test_accept_safe_id(self):
         self.assertEqual(_safe_responses_path("resp_abc-1", "GET"), "responses/resp_abc-1")
+
+
+class GenericPathTests(unittest.TestCase):
+    def test_accepts_openai_style_endpoint(self):
+        self.assertEqual(_safe_generic_path("models"), "models")
+        self.assertEqual(_safe_generic_path("files/file_123"), "files/file_123")
+
+    def test_rejects_traversal_and_empty_paths(self):
+        for path in ("", "../secret", "files\\secret"):
+            with self.assertRaises(HTTPException) as ctx:
+                _safe_generic_path(path)
+            self.assertEqual(ctx.exception.status_code, 400)
 
 
 class StandaloneSearchCapabilityTests(unittest.TestCase):
