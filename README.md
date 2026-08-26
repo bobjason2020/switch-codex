@@ -2,7 +2,7 @@
 
 OpenAI **Responses** 风格的多上游 API 路由代理 + 管理 UI，并按 DeepSeek **官方 setup 脚本**同步 Codex 本地配置。
 
-中文名「Codex 调度站」：请求像列车一样进站，按模型池调度到不同上游轨道，失败自动换轨（failover）。
+中文名「Codex 调度站」：请求按模型池调度到一个上游并原样转发。当前版本不做自动故障切换、重试、协议转换或请求模型改写；选中的上游失败时，客户端收到该次失败结果。
 
 ## 部署与使用
 
@@ -71,9 +71,9 @@ Key 仍在上游配置里，**不会**写入 `experimental_bearer_token`。
 
 ## 独立 Web Search
 
-Switchyard 支持 Codex 的独立搜索端点：`POST /v1/alpha/search`。请求保持 OpenAI Responses 格式透传，不会转换为 Chat Completions；它与普通 Responses 请求共用模型池选择、故障切换、日志和公网访问限制。
+Switchyard 支持 Codex 的独立搜索端点：`POST /v1/alpha/search`。请求保持 OpenAI Responses 格式透传；它与普通 Responses 请求共用模型池选择、日志和公网访问限制，但不会在上游失败时自动改投其它上游。
 
-只有 OpenAI Responses 上游可以承接该请求：上游模型池必须为 `openai-all`，且不能开启「Chat Completions」或「Anthropic Messages」适配。上游的 `standalone_web_search` 字段省略时保持兼容并默认允许；显式设置为 `false` 可排除该上游。
+只有默认 OpenAI Responses 上游可以承接该请求：上游模型必须为 `openai-all`，且不能启用 Chat Completions 或声明「支持 Anthropic 原生 /messages」。上游的 `standalone_web_search` 字段省略时保持兼容并默认允许；显式设置为 `false` 可排除该上游。
 
 Codex 同步会将受管 `model_providers.simple` 的显示名收敛为 `OpenAI`，并写入 `supports_standalone_web_search = true`。管理 API 可通过 `POST /api/upstreams/{id}/standalone-search-test` 验证上游的 `/alpha/search` 协议支持；该探测只发送最小校验请求，不执行实际网络搜索。
 
@@ -107,8 +107,7 @@ Codex 同步会将受管 `model_providers.simple` 的显示名收敛为 `OpenAI`
 
 ## Claude Code
 
-路由提供 Anthropic 兼容端点 `/v1/messages`（与 `/v1/responses` 共用同一套模型池、
-倍率、failover 与日志）。UI 的「Claude Code 配置」支持三种模式：
+路由提供 Anthropic Messages 原生透传端点 `/v1/messages`（与 `/v1/responses` 共用模型池选择、倍率和日志）。UI 的「Claude Code 配置」支持三种模式：
 
 - **本机原配置**：恢复项目介入前的 `~/.claude/settings.json` 快照，Claude Code 直连原 provider；
 - **openai-all**：把 `ANTHROPIC_BASE_URL` 指向本路由，模型走 `openai-all` 池；
@@ -116,9 +115,7 @@ Codex 同步会将受管 `model_providers.simple` 的显示名收敛为 `OpenAI`
 - **auto-mode-bridge 集成**：应用 `openai-all` / DeepSeek 模式时自动安装本地 PreToolUse hook（`~/.claude/auto-mode-bridge/classifier.py`），替代 Anthropic 服务端 auto 分类器（DeepSeek 后端没有服务端分类器）。规则文件为 `~/.claude/auto-mode-bridge/rules.json`，仅在首次安装时从 `sy/bridge/` 拷贝，之后**永不覆盖用户修改**。选择「本机原配置」还原时，hook 注册随快照恢复一并移除（bridge 目录保留）；也可在 UI 手动开关（Claude Code 卡片里的勾选框）。修改后需 **新开 Claude Code 会话** 生效。
 - **fail-open 策略**：hook 三层判定 fail-open——deny 规则 → allow 规则 → LLM 兜底（LLM 兜底自动走本路由 `/v1/messages`，低 effort 分类）；兜底遇 5xx 或超时一律放行。
 
-上游可在「支持 Anthropic 原生 /messages」开关开启后，把 Claude Code 请求以
-Anthropic 格式直接透传（零转换）；未开启的上游走 Anthropic → Responses 转换层，
-再把响应转回 Anthropic 格式（支持流式与非流式，含 chat/completions 上游回退）。
+只有开启「支持 Anthropic 原生 /messages」的上游可承接 Claude Code 请求。因此，选择 `openai-all` 或 DeepSeek 配置模式前，应先为其模型池启用至少一个 Anthropic 原生上游。路由会以 Anthropic 格式直接透传请求和响应；未开启该选项的上游不会被 `/v1/messages` 选择，也不存在 Anthropic、Responses 或 Chat Completions 之间的转换或回退。
 切换配置后请 **新开 Claude Code 会话**。
 
 注意：`~/.claude/settings.json` 由本路由管理；如果同时使用其它会改写该文件的工具
@@ -127,7 +124,7 @@ Anthropic 格式直接透传（零转换）；未开启的上游走 Anthropic �
 ## Grok
 
 路由同样服务 Grok CLI（grok-build）的 OpenAI **Responses** 请求（与 `/v1/responses`
-共用同一套模型池、倍率、failover 与日志）。UI 的「Grok 配置」支持两种模式：
+共用模型池选择、倍率和日志）。UI 的「Grok 配置」支持两种模式：
 
 - **本机原配置**：恢复项目介入前的 `~/.grok/config.toml` 快照，Grok CLI 直连原 provider；
 - **grok 池**：在 `~/.grok/config.toml` 写入受管模型段 `[model."grok-4.6"]`（`base_url`
@@ -159,8 +156,7 @@ sy/
   logbook.py            # 请求/错误日志、统计、历史可用性时间线
   probes.py             # 模型级联探测 + NewAPI 倍率探测
   auth.py               # 管理登录会话与客户端 key
-  proxy.py              # /v1/responses、/v1/messages 透传/转换与 failover
-  anthropic.py          # Anthropic Messages ↔ Responses 转换（含流式）
+  proxy.py              # /v1/responses、/v1/alpha/search、/v1/messages 纯透传
   claude_sync.py        # Claude Code settings.json 快照/恢复
   grok_sync.py          # Grok CLI config.toml 受管段/快照/恢复
   migrate_grok.py       # 一次性 seed grok 池上游（读 ~/.grok/config.toml）
@@ -181,8 +177,11 @@ static/
 | `data/legacy-backup/` | 首次启动时自动归档的旧 JSON/JSONL 文件（一次性迁移） |
 | `data/deepseek-models.json` | 官方 models 模板 |
 | `data/codex-backup/` | DeepSeek 模式前的 Codex 备份 |
+| `data/claude-backup/` | Claude Code 介入前的 settings.json 备份 |
 | `data/grok-backup/` | Grok 介入前快照与 restore-point 备份 |
 | `logs/switchyard.tmux.log` | 服务运行日志 |
+
+`data/` 及其中的数据库、导出和客户端配置快照仅供运行服务的本机用户访问（目录 `0700`、敏感文件 `0600`）。历史备份保留用于恢复；清理前应先验证恢复需求。
 
 旧版本使用的 `config.json` / `upstreams.json` / `auth.json` /
 `newapi_probes.json` / `request_logs.jsonl` / `error_logs.jsonl` /
@@ -194,6 +193,7 @@ static/
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/v1/responses` | OpenAI Responses 代理端点 |
+| GET / POST / DELETE | `/v1/responses/{id}` | OpenAI Responses 对象操作，方法和路径原样转发 |
 | POST | `/v1/alpha/search` | Codex 独立 Web Search 代理端点，仅路由到兼容的 OpenAI Responses 上游 |
 | PUT | `/api/active-model` | `{"active_model":"..."}` 切换池 + 同步 Codex |
 | GET | `/api/models` | 模型池 + codex_sync 类型 |
