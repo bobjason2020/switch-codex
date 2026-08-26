@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
-from sy.auth import _keys_equal
+from sy.auth import _keys_equal, login_client_ip
 from sy.logbook import _extract_reasoning_effort, _extract_session_id
 from sy.proxy import _safe_responses_path
 from sy.core import upstream_supports_standalone_web_search
@@ -22,6 +24,28 @@ class KeyCompareTests(unittest.TestCase):
 
     def test_length_mismatch(self):
         self.assertFalse(_keys_equal("short", "much-longer-key"))
+
+
+class LoginClientIpTests(unittest.TestCase):
+    def _request(self, headers=None, host="127.0.0.1"):
+        return SimpleNamespace(headers=headers or {}, client=SimpleNamespace(host=host))
+
+    @patch("sy.auth.core.load_public_config")
+    def test_ignores_proxy_headers_unless_explicitly_trusted(self, load_public_config):
+        load_public_config.return_value = {"trust_proxy_headers": False}
+        request = self._request({"cf-connecting-ip": "198.51.100.8"})
+        self.assertEqual(login_client_ip(request), "127.0.0.1")
+
+    @patch("sy.auth.core.load_public_config")
+    def test_uses_proxy_headers_when_explicitly_trusted(self, load_public_config):
+        load_public_config.return_value = {"trust_proxy_headers": True}
+        request = self._request(
+            {
+                "x-forwarded-for": "198.51.100.8, 10.0.0.1",
+                "cf-connecting-ip": "198.51.100.9",
+            }
+        )
+        self.assertEqual(login_client_ip(request), "198.51.100.8")
 
 
 class ResponsesPathTests(unittest.TestCase):

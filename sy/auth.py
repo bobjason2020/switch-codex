@@ -245,13 +245,16 @@ def revoke_all_sessions() -> None:
 
 
 def login_client_ip(request) -> str:
-    """登录限流按 Cloudflare 真实 IP，其次才用 socket 对端。"""
-    try:
-        cf = (request.headers.get("cf-connecting-ip") or "").strip()
-    except Exception:
-        cf = ""
-    if cf:
-        return cf.split(",")[0].strip()
+    """Return the rate-limit address using the configured proxy-header policy."""
+    public = core.load_public_config()
+    if public.get("trust_proxy_headers"):
+        try:
+            for header in ("x-forwarded-for", "cf-connecting-ip", "x-real-ip"):
+                value = (request.headers.get(header) or "").strip()
+                if value:
+                    return value.split(",")[0].strip()
+        except Exception:
+            pass
     client = getattr(request, "client", None)
     return client.host if client else ""
 

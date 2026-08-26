@@ -282,14 +282,18 @@ async def _probe_upstream(
             probe_headers["anthropic-version"] = "2023-06-01"
         else:
             probe_headers["Authorization"] = f"Bearer {target['api_key']}"
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        # A redirect target is not an authenticated upstream. Do not forward
+        # upstream credentials to it.
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
             r = await client.post(
                 url,
                 headers=probe_headers,
                 json=payload,
             )
         duration_ms = (time.perf_counter() - t0) * 1000.0
-        ok = r.status_code < 400
+        # Redirects are deliberately not followed, so only a real successful
+        # response may mark this upstream healthy.
+        ok = 200 <= r.status_code < 300
         usage = logbook._extract_usage(r.content) if ok else None
         err_text = None if ok else (r.text[:500] or f"HTTP {r.status_code}")
         if record_log:
@@ -792,9 +796,10 @@ def _fetch_newapi_group_ratio(
     errors: list[str] = []
 
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        # The optional access token must never be sent to a redirect target.
+        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
             r = client.get(f"{base_url}/api/user/groups", headers=headers)
-        if r.status_code < 400:
+        if 200 <= r.status_code < 300:
             payload = r.json()
             data = payload.get("data") if isinstance(payload, dict) else None
             if isinstance(data, dict):
@@ -807,11 +812,11 @@ def _fetch_newapi_group_ratio(
 
     if not groups:
         try:
-            with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            with httpx.Client(timeout=timeout, follow_redirects=False) as client:
                 r = client.get(
                     f"{base_url}/api/pricing", headers={"Accept": "application/json"}
                 )
-            if r.status_code < 400:
+            if 200 <= r.status_code < 300:
                 payload = r.json()
                 gr = payload.get("group_ratio") if isinstance(payload, dict) else None
                 if isinstance(gr, dict):
