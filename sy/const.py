@@ -43,8 +43,10 @@ CACHE_MISS_MAX_GAP_SEC = 3600
 # 请求上下文在客户端重算时可能少量回退；在该容差内仍视为同一缓存前缀。
 # 明显缩短则归类为上下文收缩，不把它误报成掉缓存。
 CACHE_MISS_INPUT_SHRINK_TOLERANCE_TOKENS = 2048
+# 掉缓存少于该 token 数时视为正常波动，不计入掉缓存统计。
+CACHE_MISS_MIN_LOST_TOKENS = 10_000
 # 持久化判定版本。规则变化时历史日志必须重新计算，而不是沿用旧 false。
-CACHE_MISS_RULE_VERSION = 3
+CACHE_MISS_RULE_VERSION = 4
 ERROR_LOG_BODY_MAX_BYTES = 1024 * 1024
 ERROR_LOG_ATTEMPT_BODY_MAX = 2000
 LOG_STREAM_BUF_MAX = 4 * 1024 * 1024

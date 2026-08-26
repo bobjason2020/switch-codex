@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from unittest import mock
 
 from sy import core, db
-from sy.const import CACHE_MISS_MAX_GAP_SEC
+from sy.const import CACHE_MISS_MAX_GAP_SEC, CACHE_MISS_MIN_LOST_TOKENS
 
 # import 时会安排后台维护，测试环境不触发真实数据库回填。
 with mock.patch.object(
@@ -130,6 +130,25 @@ class AnnotateCacheMissTests(unittest.TestCase):
         ]
         logbook._annotate_cache_misses(items)
         self.assertFalse(items[1]["is_cache_miss"])
+
+    def test_small_cache_drop_is_not_marked(self):
+        items = [
+            ent("S", "2026-08-25T10:00:00+08:00", 100000, 20000),
+            ent("S", "2026-08-25T10:01:00+08:00", 100500, 10001),
+        ]
+        logbook._annotate_cache_misses(items)
+        self.assertFalse(items[1]["is_cache_miss"])
+        self.assertEqual(items[1]["cache_miss_tokens"], 0)
+        self.assertEqual(items[1]["cache_miss_extra_usd"], 0.0)
+
+    def test_cache_drop_at_threshold_is_marked(self):
+        items = [
+            ent("S", "2026-08-25T10:00:00+08:00", 100000, 20000),
+            ent("S", "2026-08-25T10:01:00+08:00", 100500, 10000),
+        ]
+        logbook._annotate_cache_misses(items)
+        self.assertEqual(items[1]["cache_miss_tokens"], CACHE_MISS_MIN_LOST_TOKENS)
+        self.assertTrue(items[1]["is_cache_miss"])
 
     def test_different_session_or_no_session_not_marked(self):
         items = [
@@ -315,6 +334,14 @@ class AttachCacheMissFieldsTests(unittest.TestCase):
             e = ent("S", "2026-08-25T10:01:00+08:00", 300500, 2816, upstream="jucode")
             logbook._attach_cache_miss_fields(e)
         self.assertFalse(e["is_cache_miss"])
+
+    def test_small_cache_drop_is_not_marked_on_write_path(self):
+        prev = ent("S", "2026-08-25T10:00:00+08:00", 100000, 20000, upstream="jucode")
+        with mock.patch.object(db, "load_last_usage_entry", return_value=prev):
+            e = ent("S", "2026-08-25T10:01:00+08:00", 100500, 10001, upstream="jucode")
+            logbook._attach_cache_miss_fields(e)
+        self.assertFalse(e["is_cache_miss"])
+        self.assertEqual(e["cache_miss_tokens"], 0)
 
     def test_no_session_or_usage_not_marked(self):
         with mock.patch.object(db, "load_last_usage_entry", return_value=None):

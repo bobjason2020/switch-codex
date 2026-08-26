@@ -507,8 +507,8 @@ def load_last_usage_entry(session_id: str, upstream: str) -> Optional[dict]:
     return _decode(row["payload"]) if row is not None else None
 
 
-def has_request_logs_missing_field(field: str) -> bool:
-    """是否存在 payload 里缺少指定字段的请求日志（用于判定是否需要一次性回填）。"""
+def has_request_logs_missing_field(field: str, expected_value: Any = None) -> bool:
+    """是否存在 payload 缺少字段或字段值不符合预期的请求日志。"""
     paths = {
         "is_cache_miss": "$.is_cache_miss",
         "cache_miss_tokens": "$.cache_miss_tokens",
@@ -522,11 +522,19 @@ def has_request_logs_missing_field(field: str) -> bool:
         raise ValueError(f"unsupported request log field: {field!r}")
     with _lock:
         conn = _get_conn()
-        row = conn.execute(
-            "SELECT seq FROM request_logs "
-            "WHERE json_extract(payload, ?) IS NULL LIMIT 1",
-            (path,),
-        ).fetchone()
+        if expected_value is None:
+            row = conn.execute(
+                "SELECT seq FROM request_logs "
+                "WHERE json_extract(payload, ?) IS NULL LIMIT 1",
+                (path,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT seq FROM request_logs "
+                "WHERE json_extract(payload, ?) IS NULL "
+                "OR json_extract(payload, ?) != ? LIMIT 1",
+                (path, path, expected_value),
+            ).fetchone()
     return row is not None
 
 

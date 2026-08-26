@@ -20,6 +20,7 @@ from sy import core, db, timeutil
 
 from sy.const import (
     AVAIL_HISTORY_RETENTION_DAYS,
+    CACHE_MISS_MIN_LOST_TOKENS,
     CACHE_MISS_MAX_GAP_SEC,
     CACHE_MISS_INPUT_SHRINK_TOLERANCE_TOKENS,
     CACHE_MISS_RULE_VERSION,
@@ -534,7 +535,7 @@ def _mark_cache_miss(entry: dict, prev: tuple[str, Optional[int], Optional[int]]
         and input_delta >= -CACHE_MISS_INPUT_SHRINK_TOLERANCE_TOKENS
     ):
         lost = max(min(prev_cr, entry["input_tokens"]) - entry["cache_read_tokens"], 0)
-        if lost > 0:
+        if lost >= CACHE_MISS_MIN_LOST_TOKENS:
             entry["is_cache_miss"] = True
             entry["cache_miss_tokens"] = lost
             entry["cache_miss_type"] = "prefix_reset"
@@ -644,16 +645,18 @@ def _annotate_cache_misses(
 def _backfill_cache_miss_fields() -> int:
     """分批回填历史日志，供后台维护线程调用，不在启动路径阻塞代理。"""
     try:
-        if not any(
-            db.has_request_logs_missing_field(field)
-            for field in (
-                "is_cache_miss",
-                "cache_miss_tokens",
-                "cache_miss_extra_usd",
-                "cache_miss_type",
-                "cache_miss_rule_version",
+        fields_need_backfill = (
+            "is_cache_miss",
+            "cache_miss_tokens",
+            "cache_miss_extra_usd",
+            "cache_miss_type",
+        )
+        needs_backfill = any(db.has_request_logs_missing_field(field) for field in fields_need_backfill)
+        if not needs_backfill:
+            needs_backfill = db.has_request_logs_missing_field(
+                "cache_miss_rule_version", CACHE_MISS_RULE_VERSION
             )
-        ):
+        if not needs_backfill:
             return 0
     except Exception:
         log.exception("check cache-miss backfill need failed")
