@@ -433,6 +433,14 @@ td[colspan] { text-align: center; color: var(--muted); padding: 34px 8px; }
 .box.sid-9 { background: rgba(169, 227, 75, 0.16); color: #c0eb75; border: 1px solid rgba(169, 227, 75, 0.28); }
 /* 分类器标签：灰色低透明度，置于 effort 旁 */
 .box.box-cls { margin-left: 6px; padding: 0 5px; border-radius: 4px; font-size: 0.7rem; white-space: nowrap; background: rgba(148, 148, 148, 0.14); color: #bdbdbd; border: 1px solid rgba(148, 148, 148, 0.25); }
+/* 掉缓存：红色感叹号圆球，悬浮显示丢失缓存与多花金额 */
+.cell-2l .cm-flag {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 14px; height: 14px; margin-left: 6px; border-radius: 50%;
+  background: #dc2626; color: #fff; font-size: 10px; font-weight: 700;
+  line-height: 1; vertical-align: middle; cursor: help;
+}
+.cell-2l .cm-flag:hover { background: #b91c1c; }
 .log-table { min-width: 1120px; }
 .col-model { white-space: nowrap; word-break: normal; overflow-wrap: normal; }
 
@@ -621,6 +629,15 @@ code { font-size: 0.85em; padding: 1px 5px; border-radius: 5px; background: rgba
 .stat .num.warn { color: var(--warn); }
 .stat .num.err { color: var(--danger); }
 .stat .num.na { color: var(--muted); }
+/* 统计卡指标说明：小圆圈感叹号，悬浮显示口径说明 */
+.stat-hint {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 13px; height: 13px; margin-left: 4px; border-radius: 50%;
+  background: rgba(148, 163, 184, 0.28); color: #94a3b8;
+  font-size: 9px; font-weight: 700; line-height: 1; vertical-align: middle;
+  cursor: help;
+}
+.stat-hint:hover { background: rgba(148, 163, 184, 0.5); color: #e2e8f0; }
 
 .overview-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 16px; }
 .chart-card { min-width: 0; margin-bottom: 0; }

@@ -38,6 +38,8 @@ ERROR_LOG_RETENTION_HOURS = 24
 REQUEST_LOG_RETENTION_DAYS = 30
 AVAIL_HISTORY_RETENTION_DAYS = 14
 CACHE_PRIORITY_TTL_SEC = 3600
+# 掉缓存判定：同会话同上游相邻请求间隔超过该秒数视为缓存自然过期，不判掉缓存。
+CACHE_MISS_MAX_GAP_SEC = 3600
 ERROR_LOG_BODY_MAX_BYTES = 1024 * 1024
 ERROR_LOG_ATTEMPT_BODY_MAX = 2000
 LOG_STREAM_BUF_MAX = 4 * 1024 * 1024
@@ -91,27 +93,6 @@ DEFAULT_NEWAPI_PROBE = {
 # UI 配色（历史可用性色块）
 COLOR_MID = "#c2410c"
 COLOR_BAD = "#ef4444"
-
-# 代理 failover 状态码与容量提示
-FAILOVER_STATUS = {401, 403, 408, 429, 500, 502, 503, 504}
-# 首选上游在瞬态失败后的同渠道重试次数：首次失败后再重试 2 次（共 3 次尝试），
-# 全部失败才触发重新级联。401/403 等凭证错误不重试。
-PREFERRED_RETRY_COUNT = 2
-PREFERRED_RETRY_BASE_DELAY_SEC = 0.5
-# 流式响应尚未向客户端输出任何字节时的本地快速重试次数。
-# 一旦已经输出内容，不能安全重放同一请求，交由客户端 reconnect。
-STREAM_PREOUTPUT_RETRY_COUNT = 2
-STREAM_RETRY_BASE_DELAY_SEC = 0.5
-CAPACITY_HINTS = (
-    "at capacity",
-    "over capacity",
-    "capacity reached",
-    "capacity exceeded",
-    "model is overloaded",
-    "service is overloaded",
-    "please try a different model",
-    "no capacity",
-)
 
 # 管理认证
 DEFAULT_ADMIN_PASSWORD = "admin123"

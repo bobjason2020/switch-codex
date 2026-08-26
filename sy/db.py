@@ -179,12 +179,20 @@ def _decode(raw: Any) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _ensure_data_dir() -> None:
+    DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(DATA, 0o700)
+    except OSError:
+        pass
+
+
 def _migrate_old_db_if_needed() -> None:
     """从旧 simple_router.db 平滑迁移到 switchyard.db（先备份，不删除旧库）。"""
     if DB_PATH.exists() or not LEGACY_DB.exists():
         return
     try:
-        DATA.mkdir(parents=True, exist_ok=True)
+        _ensure_data_dir()
         src = sqlite3.connect(f"file:{LEGACY_DB}?mode=ro", uri=True)
         dst = sqlite3.connect(DB_PATH)
         src.backup(dst)
@@ -200,7 +208,7 @@ def _migrate_old_db_if_needed() -> None:
 
 
 def _connect() -> sqlite3.Connection:
-    DATA.mkdir(parents=True, exist_ok=True)
+    _ensure_data_dir()
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -457,6 +465,106 @@ def load_request_logs() -> list[dict]:
     return [_decode(r["payload"]) for r in rows]
 
 
+def load_request_logs_range(
+    start: Optional[str] = None, end: Optional[str] = None
+) -> list[dict]:
+    """按 ts 范围加载请求日志(升序),start/end 为 ISO 字符串,含 start、不含 end。"""
+    where: list[str] = []
+    params: list[Any] = []
+    if start:
+        where.append("ts >= ?")
+        params.append(start)
+    if end:
+        where.append("ts < ?")
+        params.append(end)
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    with _lock:
+        conn = _get_conn()
+        rows = conn.execute(
+            f"SELECT payload FROM request_logs{where_sql} ORDER BY seq", params
+        ).fetchall()
+    return [_decode(r["payload"]) for r in rows]
+
+
+def load_last_usage_entry(session_id: str, upstream: str) -> Optional[dict]:
+    """返回同 (session_id, upstream) 最近一条带 usage(cache_read/input 齐全)的日志。
+
+    供写路径增量判定掉缓存时补种前驱状态；无则返回 None。
+    """
+    with _lock:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT payload FROM request_logs "
+            "WHERE json_extract(payload, '$.session_id') = ? "
+            "AND upstream = ? "
+            "AND json_extract(payload, '$.cache_read_tokens') IS NOT NULL "
+            "AND json_extract(payload, '$.input_tokens') IS NOT NULL "
+            "ORDER BY seq DESC LIMIT 1",
+            (str(session_id), str(upstream)),
+        ).fetchone()
+    return _decode(row["payload"]) if row is not None else None
+
+
+def has_request_logs_missing_field(field: str) -> bool:
+    """是否存在 payload 里缺少指定字段的请求日志（用于判定是否需要一次性回填）。"""
+    paths = {
+        "is_cache_miss": "$.is_cache_miss",
+        "cache_miss_tokens": "$.cache_miss_tokens",
+        "cache_miss_extra_usd": "$.cache_miss_extra_usd",
+        "multiplier": "$.multiplier",
+    }
+    path = paths.get(str(field))
+    if path is None:
+        raise ValueError(f"unsupported request log field: {field!r}")
+    with _lock:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT seq FROM request_logs "
+            "WHERE json_extract(payload, ?) IS NULL LIMIT 1",
+            (path,),
+        ).fetchone()
+    return row is not None
+
+
+def load_request_log_rows() -> list[tuple[int, dict]]:
+    """返回 (seq, payload) 列表(升序),供字段回填按行定位更新。"""
+    with _lock:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT seq, payload FROM request_logs ORDER BY seq"
+        ).fetchall()
+    return [(int(r["seq"]), _decode(r["payload"])) for r in rows]
+
+
+def load_request_log_rows_after(seq: int = 0, limit: int = 500) -> list[tuple[int, dict]]:
+    """Load a bounded, ordered batch for resumable maintenance jobs."""
+    limit = max(1, min(int(limit), 5000))
+    with _lock:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT seq, payload FROM request_logs WHERE seq > ? ORDER BY seq LIMIT ?",
+            (int(seq), limit),
+        ).fetchall()
+    return [(int(r["seq"]), _decode(r["payload"])) for r in rows]
+
+
+def update_request_log_payloads(pairs: list[tuple[int, dict]]) -> None:
+    """按 seq 逐条更新 payload(不增删行,回填期间并发写入的新行不受影响)。"""
+    with _lock:
+        conn = _get_conn()
+        conn.execute("BEGIN")
+        try:
+            for seq, item in pairs:
+                conn.execute(
+                    "UPDATE request_logs SET payload = ? WHERE seq = ?",
+                    (json.dumps(item, ensure_ascii=False), int(seq)),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def query_request_logs(
     limit: int,
     offset: int,
@@ -471,6 +579,8 @@ def query_request_logs(
     """Paginated request-log query (newest first)."""
     where: list[str] = []
     params: list[Any] = []
+    # The management request-log view excludes health/probe traffic.
+    where.append("is_probe = 0")
     if start:
         where.append("ts >= ?")
         params.append(start)
@@ -491,6 +601,11 @@ def query_request_logs(
             where.append("status >= 200 AND status < 400")
         elif status in ("error", "fail"):
             where.append("status IS NULL OR status < 200 OR status >= 400")
+        elif status == "cache_miss":
+            where.append(
+                "status >= 200 AND status < 400 "
+                "AND json_extract(payload, '$.is_cache_miss') IN (1, true)"
+            )
         elif str(status).isdigit():
             where.append("status = ?")
             params.append(int(status))

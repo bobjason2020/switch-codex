@@ -11,13 +11,16 @@ import logging
 import math
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timedelta
+from threading import Lock, Thread
 from typing import Any, Optional
 
 from sy import core, db, timeutil
 
 from sy.const import (
     AVAIL_HISTORY_RETENTION_DAYS,
+    CACHE_MISS_MAX_GAP_SEC,
     COLOR_MID,
     COLOR_BAD,
     ERROR_LOG_BODY_MAX_BYTES,
@@ -33,6 +36,13 @@ _timestamp_in_beijing = timeutil.timestamp_in_beijing
 _entry_in_beijing = timeutil.entry_in_beijing
 _iso_now = timeutil.iso_now
 _last_req_prune = 0.0
+_last_error_prune = 0.0
+_ERROR_PRUNE_INTERVAL_SEC = 3600
+_CACHE_MISS_STATE_TTL_SEC = 2 * 3600
+_CACHE_MISS_STATE_MAX_ENTRIES = 10_000
+_CACHE_MISS_BACKFILL_BATCH_SIZE = 250
+_cache_miss_backfill_lock = Lock()
+_cache_miss_backfill_started = False
 
 
 def _maybe_prune_request_logs() -> None:
@@ -340,6 +350,7 @@ def _record_log(**fields: Any) -> None:
                     break
         except Exception:
             log.exception("backfill upstream_id failed")
+    _attach_cache_miss_fields(entry)
     try:
         db.insert_request_log(entry)
         _maybe_prune_request_logs()
@@ -355,25 +366,340 @@ def _traffic_logs_snapshot() -> list[dict]:
     return [e for e in _logs_snapshot() if not _is_probe_log(e)]
 
 
+def _traffic_logs_in_range(
+    start: Optional[datetime] = None, end: Optional[datetime] = None
+) -> list[dict]:
+    """按 ts 范围加载非 probe 请求日志(升序)。"""
+    return [
+        e
+        for e in db.load_request_logs_range(
+            start.isoformat(timespec="milliseconds") if start else None,
+            end.isoformat(timespec="milliseconds") if end else None,
+        )
+        if not _is_probe_log(e)
+    ]
+
+
+def _is_success_status(st: Any) -> bool:
+    """成功 = 状态码非空且 200 <= status < 400(与 db 查询语义一致)。"""
+    if st is None:
+        return False
+    try:
+        return 200 <= int(st) < 400
+    except (TypeError, ValueError):
+        return False
+
+
+def _seconds_between(ts_a: Any, ts_b: Any) -> Optional[float]:
+    """两个时间戳的间隔秒数(ts_b − ts_a),解析失败返回 None。"""
+    da = _parse_ts(ts_a)
+    db = _parse_ts(ts_b)
+    if da is None or db is None:
+        return None
+    return (db - da).total_seconds()
+
+
+def _cache_miss_extra_usd(entry: dict, lost_tokens: int) -> float:
+    """丢失缓存的额外费用 = 丢失 token × (输入价 − 缓存读价) / 1M,按本条档位计价。"""
+    pr = core._effective_prices(
+        core.pricing_for(entry.get("pool") or "", entry.get("client_model")),
+        entry.get("input_tokens"),
+    )
+    inp = pr["input_per_m"] or 0.0
+    crp = pr["cache_read_per_m"]
+    if crp is None:
+        crp = inp
+    return lost_tokens * (inp - crp) / 1_000_000
+
+
+def _mark_cache_miss(entry: dict, prev: tuple[str, Optional[int], Optional[int]]) -> None:
+    """按同 (session_id, upstream) 前驱判定本条是否掉缓存,命中则就地标记。
+
+    prev = (ts, cache_read_tokens, input_tokens),为同会话同上游上一条带 usage 的记录。
+    只标记成功请求(status 2xx/3xx),保证「掉缓存 ⊆ 成功」。
+    """
+    if not _is_success_status(entry.get("status")):
+        return
+    prev_ts, prev_cr, prev_in = prev
+    if prev_cr is None or prev_in is None:
+        return
+    if entry["cache_read_tokens"] < prev_cr and entry["input_tokens"] >= prev_in:
+        lost = max(min(prev_cr, entry["input_tokens"]) - entry["cache_read_tokens"], 0)
+        if lost > 0:
+            entry["is_cache_miss"] = True
+            entry["cache_miss_tokens"] = lost
+            entry["cache_miss_extra_usd"] = _cache_miss_extra_usd(entry, lost)
+
+
+# 写路径增量判定用的同会话前驱状态。状态采用 LRU + TTL，避免高基数 session
+# 长期运行时无限增长；None 表示已从库补种但没有可比较前驱。
+_last_usage_state: OrderedDict[
+    tuple[str, str], tuple[float, Optional[tuple[str, Optional[int], Optional[int]]]]
+] = OrderedDict()
+
+
+def _last_usage_entry_in_db(session_id: str, upstream: str) -> Optional[dict]:
+    try:
+        return db.load_last_usage_entry(session_id, upstream)
+    except Exception:
+        log.exception("load last usage entry failed")
+        return None
+
+
+def _attach_cache_miss_fields(entry: dict) -> None:
+    """写路径:把掉缓存三个字段持久化到本条日志(默认值 + 与前驱增量判定)。"""
+    entry["is_cache_miss"] = False
+    entry["cache_miss_tokens"] = 0
+    entry["cache_miss_extra_usd"] = 0.0
+    sid = entry.get("session_id")
+    if not sid or entry.get("cache_read_tokens") is None or entry.get("input_tokens") is None:
+        return
+    key = (str(sid), str(entry.get("upstream") or ""))
+    now = time.monotonic()
+    state = _last_usage_state.pop(key, None)
+    if state is None or now - state[0] > _CACHE_MISS_STATE_TTL_SEC:
+        last = _last_usage_entry_in_db(*key)
+        prev = (
+            (str(last.get("ts") or ""), last.get("cache_read_tokens"), last.get("input_tokens"))
+            if last is not None
+            else None
+        )
+    else:
+        prev = state[1]
+    if prev is not None:
+        gap = _seconds_between(prev[0], entry.get("ts"))
+        if gap is not None and gap <= CACHE_MISS_MAX_GAP_SEC:
+            _mark_cache_miss(entry, prev)
+    _last_usage_state[key] = (
+        now,
+        (str(entry.get("ts") or ""), entry["cache_read_tokens"], entry["input_tokens"]),
+    )
+    while len(_last_usage_state) > _CACHE_MISS_STATE_MAX_ENTRIES:
+        _last_usage_state.popitem(last=False)
+
+
+def _annotate_cache_misses(
+    items: list[dict], max_gap_sec: int = CACHE_MISS_MAX_GAP_SEC
+) -> None:
+    """就地给每条日志附加掉缓存标记(一次性回填 / 测试用)。
+
+    同一 (session_id, upstream) 内按时间升序比较:本条 cache_read < 上一条
+    (同会话同上游、有 usage)的 cache_read,且本条 input_tokens >= 上一条
+    input_tokens,且相邻间隔 <= max_gap_sec → 判为掉缓存。间隔超过上限视为
+    缓存自然过期,不计。缓存按上游隔离,跨上游的同会话请求不可比。
+    只标记成功请求(status 2xx/3xx),保证「掉缓存 ⊆ 成功」。
+    附加字段:is_cache_miss / cache_miss_tokens(丢失缓存 token,>=0) /
+    cache_miss_extra_usd(= 丢失缓存 × (输入价 − 缓存读价) / 1M,按本条档位计价)。
+    """
+    for e in items:
+        e["is_cache_miss"] = False
+        e["cache_miss_tokens"] = 0
+        e["cache_miss_extra_usd"] = 0.0
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for e in items:
+        sid = e.get("session_id")
+        if sid:
+            key = (str(sid), str(e.get("upstream") or ""))
+            groups.setdefault(key, []).append(e)
+    for es in groups.values():
+        es.sort(key=lambda x: str(x.get("ts") or ""))
+        prev: Optional[tuple[str, Optional[int], Optional[int]]] = None
+        for e in es:
+            if e.get("cache_read_tokens") is None or e.get("input_tokens") is None:
+                continue  # 无 usage 跳过,不打断相邻关系
+            if prev is not None:
+                gap = _seconds_between(prev[0], e.get("ts"))
+                if gap is not None and gap <= max_gap_sec:
+                    _mark_cache_miss(e, prev)
+            prev = (str(e.get("ts") or ""), e["cache_read_tokens"], e["input_tokens"])
+
+
+def _backfill_cache_miss_fields() -> int:
+    """分批回填历史日志，供后台维护线程调用，不在启动路径阻塞代理。"""
+    try:
+        if not any(
+            db.has_request_logs_missing_field(field)
+            for field in ("is_cache_miss", "cache_miss_tokens", "cache_miss_extra_usd")
+        ):
+            return 0
+    except Exception:
+        log.exception("check cache-miss backfill need failed")
+        return 0
+    state: OrderedDict[
+        tuple[str, str], Optional[tuple[str, Optional[int], Optional[int]]]
+    ] = OrderedDict()
+    last_seq = 0
+    changed_count = 0
+    while True:
+        try:
+            pairs = db.load_request_log_rows_after(last_seq, _CACHE_MISS_BACKFILL_BATCH_SIZE)
+        except Exception:
+            log.exception("load cache-miss backfill batch failed")
+            return changed_count
+        if not pairs:
+            break
+        changed: list[tuple[int, dict]] = []
+        for seq, entry in pairs:
+            last_seq = seq
+            needs_fields = any(
+                field not in entry
+                for field in ("is_cache_miss", "cache_miss_tokens", "cache_miss_extra_usd")
+            )
+            entry["is_cache_miss"] = False
+            entry["cache_miss_tokens"] = 0
+            entry["cache_miss_extra_usd"] = 0.0
+            sid = entry.get("session_id")
+            if sid and entry.get("cache_read_tokens") is not None and entry.get("input_tokens") is not None:
+                key = (str(sid), str(entry.get("upstream") or ""))
+                prev = state.pop(key, None)
+                if prev is not None:
+                    gap = _seconds_between(prev[0], entry.get("ts"))
+                    if gap is not None and gap <= CACHE_MISS_MAX_GAP_SEC:
+                        _mark_cache_miss(entry, prev)
+                state[key] = (
+                    str(entry.get("ts") or ""),
+                    entry["cache_read_tokens"],
+                    entry["input_tokens"],
+                )
+                while len(state) > _CACHE_MISS_STATE_MAX_ENTRIES:
+                    state.popitem(last=False)
+            if needs_fields:
+                changed.append((seq, entry))
+        if changed:
+            try:
+                db.update_request_log_payloads(changed)
+            except Exception:
+                log.exception("update cache-miss backfill batch failed")
+                return changed_count
+            changed_count += len(changed)
+        # Yield between short database transactions so forwarding has priority.
+        time.sleep(0.01)
+    log.info("backfilled cache-miss fields for %s request logs", changed_count)
+    return changed_count
+
+
+def _schedule_cache_miss_backfill() -> None:
+    """Run bounded log maintenance outside module import/startup work."""
+    global _cache_miss_backfill_started
+    with _cache_miss_backfill_lock:
+        if _cache_miss_backfill_started:
+            return
+        _cache_miss_backfill_started = True
+    Thread(
+        target=_run_log_maintenance,
+        name="switchyard-log-maintenance",
+        daemon=True,
+    ).start()
+
+
+def _filter_traffic_logs(
+    items: list[dict],
+    pool: Optional[str] = None,
+    model: Optional[str] = None,
+    status: Optional[str] = None,
+    upstream: Optional[str] = None,
+    q: Optional[str] = None,
+) -> list[dict]:
+    """Python 侧复制 db.query_request_logs 的过滤语义,并支持 status="cache_miss"。
+
+    status: success/ok(2xx/3xx)、error/fail(其余含 NULL)、cache_miss(成功且掉缓存)、数字精确。
+    """
+    needle = q.lower() if q else None
+    out: list[dict] = []
+    for e in items:
+        if pool and (e.get("pool") or "") != pool:
+            continue
+        if model:
+            cm = e.get("client_model")
+            if model == "未知模型":
+                if cm not in (None, ""):
+                    continue
+            elif cm != model:
+                continue
+        if status:
+            if status in ("success", "ok"):
+                if not _is_success_status(e.get("status")):
+                    continue
+            elif status in ("error", "fail"):
+                if _is_success_status(e.get("status")):
+                    continue
+            elif status == "cache_miss":
+                if not (e.get("is_cache_miss") and _is_success_status(e.get("status"))):
+                    continue
+            elif str(status).isdigit():
+                try:
+                    if int(e.get("status")) != int(status):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+        if upstream and str(e.get("upstream") or "") != upstream:
+            continue
+        if needle:
+            hay = " ".join(
+                [
+                    str(e.get("upstream") or ""),
+                    str(e.get("client_model") or ""),
+                    str(e.get("client_ip") or ""),
+                ]
+            ).lower()
+            if needle not in hay:
+                continue
+        out.append(e)
+    return out
+
+
 def _backfill_log_multipliers_from_current_upstreams() -> int:
+    """Normalize old log fields in bounded batches without replacing the table."""
+    try:
+        if not db.has_request_logs_missing_field("multiplier"):
+            return 0
+    except Exception:
+        log.exception("check multiplier backfill need failed")
+        return 0
     lookup = core._current_upstream_multiplier_lookup()
-    items = db.load_request_logs()
     changed = 0
-    for obj in items:
-        timestamp = _timestamp_in_beijing(obj.get("ts"))
-        if timestamp is not None and timestamp != obj.get("ts"):
-            obj["ts"] = timestamp
-            changed += 1
-        if core._float_or_none(obj.get("multiplier")) is None:
-            obj["multiplier"] = core._multiplier_from_lookup(obj, lookup)
-            changed += 1
+    last_seq = 0
+    while True:
+        try:
+            pairs = db.load_request_log_rows_after(last_seq, _CACHE_MISS_BACKFILL_BATCH_SIZE)
+        except Exception:
+            log.exception("load multiplier backfill batch failed")
+            return changed
+        if not pairs:
+            break
+        updated: list[tuple[int, dict]] = []
+        for seq, obj in pairs:
+            last_seq = seq
+            row_changed = False
+            timestamp = _timestamp_in_beijing(obj.get("ts"))
+            if timestamp is not None and timestamp != obj.get("ts"):
+                obj["ts"] = timestamp
+                row_changed = True
+            if core._float_or_none(obj.get("multiplier")) is None:
+                obj["multiplier"] = core._multiplier_from_lookup(obj, lookup)
+                row_changed = True
+            if row_changed:
+                updated.append((seq, obj))
+        if updated:
+            try:
+                db.update_request_log_payloads(updated)
+            except Exception:
+                log.exception("update multiplier backfill batch failed")
+                return changed
+            changed += len(updated)
+        time.sleep(0.01)
     if changed:
-        db.replace_request_logs(items)
         log.info("normalized request log fields count=%s", changed)
     return changed
 
 
-_backfill_log_multipliers_from_current_upstreams()
+def _run_log_maintenance() -> None:
+    _backfill_log_multipliers_from_current_upstreams()
+    _backfill_cache_miss_fields()
+
+
+# 掉缓存历史迁移在后台分批执行，导入路径不读取或改写整张请求日志表。
+_schedule_cache_miss_backfill()
 
 
 def _clear_logs() -> None:
@@ -418,10 +744,22 @@ def _record_error_log(**fields: Any) -> str:
     }
     try:
         db.insert_error_log(entry)
-        db.prune_error_logs(ERROR_LOG_RETENTION_HOURS)
+        _maybe_prune_error_logs()
     except Exception:
         log.exception("persist error log failed")
     return entry["id"]
+
+
+def _maybe_prune_error_logs() -> None:
+    global _last_error_prune
+    now = time.time()
+    if now - _last_error_prune < _ERROR_PRUNE_INTERVAL_SEC:
+        return
+    _last_error_prune = now
+    try:
+        db.prune_error_logs(ERROR_LOG_RETENTION_HOURS)
+    except Exception:
+        log.exception("prune error logs failed")
 
 
 def _error_logs_snapshot() -> list[dict]:
@@ -476,6 +814,11 @@ def _aggregate_stats(items: list[dict], now: datetime) -> dict:
     sum_in = sum_out = sum_reason = sum_cached = sum_total = 0
     total_cost = 0.0
     total_real_cost_cny = 0.0
+    cache_miss_count = 0
+    cache_miss_tokens = 0
+    cache_miss_extra_usd = 0.0
+    cache_miss_extra_cny = 0.0
+    cache_miss_base = 0
     tps_tokens = 0
     tps_seconds = 0.0
     lat: list[float] = []
@@ -521,6 +864,21 @@ def _aggregate_stats(items: list[dict], now: datetime) -> dict:
                 cost_by_upstream_cny[upstream] = (
                     cost_by_upstream_cny.get(upstream, 0.0) + real_cost
                 )
+        # 可判定掉缓存的请求:有 session 且有 usage(缓存/输入数据齐全)
+        if (
+            e.get("session_id")
+            and e.get("cache_read_tokens") is not None
+            and e.get("input_tokens") is not None
+        ):
+            cache_miss_base += 1
+        if e.get("is_cache_miss"):
+            cache_miss_count += 1
+            cache_miss_tokens += int(e.get("cache_miss_tokens") or 0)
+            cm_extra = float(e.get("cache_miss_extra_usd") or 0.0)
+            cache_miss_extra_usd += cm_extra
+            cm_real = core.compute_real_cost_cny(e, cost_usd=cm_extra)
+            if cm_real is not None:
+                cache_miss_extra_cny += cm_real
         d = e.get("duration_ms")
         if d is not None:
             try:
@@ -587,6 +945,12 @@ def _aggregate_stats(items: list[dict], now: datetime) -> dict:
         "total_reasoning_tokens": sum_reason,
         "total_cached_tokens": sum_cached,
         "cache_hit_rate": round(sum_cached / sum_in, 4) if sum_in > 0 else None,
+        "cache_miss_count": cache_miss_count,
+        "cache_miss_rate": round(cache_miss_count / cache_miss_base, 4) if cache_miss_base else None,
+        "cache_miss_base": cache_miss_base,
+        "cache_miss_tokens": cache_miss_tokens,
+        "cache_miss_extra_usd": round(cache_miss_extra_usd, 6),
+        "cache_miss_extra_cny": round(cache_miss_extra_cny, 8),
         "total_tokens": sum_total,
         "avg_tps": (
             round(tps_tokens / tps_seconds, 1) if tps_tokens > 0 and tps_seconds > 0 else None
@@ -664,16 +1028,16 @@ def _log_stats(
     model: Optional[str] = None,
     upstream: Optional[str] = None,
 ) -> dict:
-    items = _traffic_logs_snapshot()
+    start, end = _resolve_log_range(range_)
+    items = _traffic_logs_in_range(start, end)
+    # 掉缓存标记已随日志持久化(写路径/一次性回填),这里只按 pool/model/upstream 过滤
     if pool:
         items = [e for e in items if (e.get("pool") or "") == pool]
     if model:
         items = [e for e in items if core._request_model_label(e) == model]
     if upstream:
         items = [e for e in items if str(e.get("upstream") or "") == upstream]
-    start, end = _resolve_log_range(range_)
     now = _now_beijing()
-    items = _entries_in_log_range(items, start, end)
     return _aggregate_stats(items, now)
 
 

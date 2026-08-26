@@ -483,22 +483,26 @@
         { l: "启用上游", v: fmtNum(health.upstreams_enabled), c: "" },
         { l: "池内上游", v: fmtNum(health.upstreams_in_scope), c: "" },
       ];
+      const hint = (t) => (t ? `<span class="stat-hint" title="${escapeHtml(t)}">!</span>` : "");
       const requestCards = [
         { l: "请求总数", v: fmtNum(stats.total), c: "" },
-        { l: "成功率", v: rate, c: rateCls },
-        { l: "输入(非缓存)", v: fmtTok(Math.max(0, (stats.total_input_tokens || 0) - (stats.total_cached_tokens || 0))), c: "" },
-        { l: "缓存", v: fmtTok(stats.total_cached_tokens), c: "" },
-        { l: "输出(含推理)", v: fmtTok((stats.total_output_tokens || 0) + (stats.total_reasoning_tokens || 0)), c: "" },
+        { l: "成功率", v: rate, c: rateCls, h: "成功请求(status 2xx/3xx)占总请求的比例" },
+        { l: "输入(非缓存)", v: fmtTok(Math.max(0, (stats.total_input_tokens || 0) - (stats.total_cached_tokens || 0))), c: "", h: "未命中缓存的输入 tokens = 总输入 − 缓存命中" },
+        { l: "缓存", v: fmtTok(stats.total_cached_tokens), c: "", h: "缓存命中 tokens(缓存读 + 缓存写)" },
+        { l: "输出(含推理)", v: fmtTok((stats.total_output_tokens || 0) + (stats.total_reasoning_tokens || 0)), c: "", h: "输出 tokens,已包含推理/思考 tokens" },
         { l: "总 Tokens", v: fmtTok(stats.total_tokens), c: "" },
-        { l: "缓存命中率", v: stats.cache_hit_rate == null ? "" : (stats.cache_hit_rate * 100).toFixed(1) + "%", c: "" },
-        { l: "平均首字", v: fmtDur(stats.avg_ttft_ms), c: "" },
-        { l: "平均用时", v: fmtDur(stats.avg_duration_ms), c: "" },
-        { l: "平均TPS", v: fmtTps(stats.avg_tps), c: "" },
-        { l: "总费用", v: fmtMoney(stats.total_cost), c: "" },
-        { l: "总成本", v: fmtTotalCny(stats.total_real_cost_cny), c: "" },
+        { l: "缓存命中率", v: stats.cache_hit_rate == null ? "" : (stats.cache_hit_rate * 100).toFixed(1) + "%", c: "", h: "缓存命中 tokens ÷ 输入 tokens" },
+        { l: "掉缓存", v: fmtNum(stats.cache_miss_count), c: stats.cache_miss_count ? "warn" : "", h: "掉缓存请求次数(同一会话同上游内缓存未续上)" },
+        { l: "掉缓存率", v: stats.cache_miss_rate == null ? "" : (stats.cache_miss_rate * 100).toFixed(1) + "%", c: "", h: `掉缓存次数 ÷ 可判定请求数(${fmtNum(stats.cache_miss_base)} 条,即有 session 且有 usage 的请求);无 session / 无 usage 的请求不计入分母` },
+        { l: "掉缓存多花", v: fmtMoney(stats.cache_miss_extra_usd), c: stats.cache_miss_extra_usd ? "warn" : "", h: "因掉缓存相对「缓存正常续上」多花的费用(USD)" },
+        { l: "平均首字", v: fmtDur(stats.avg_ttft_ms), c: "", h: "平均首 token 延迟(TTFT)" },
+        { l: "平均用时", v: fmtDur(stats.avg_duration_ms), c: "", h: "平均请求总耗时" },
+        { l: "平均TPS", v: fmtTps(stats.avg_tps), c: "", h: "每秒输出 tokens = 输出 tokens ÷ 耗时(已含推理)" },
+        { l: "总费用", v: fmtMoney(stats.total_cost), c: "", h: "按配置单价计算的 USD 费用" },
+        { l: "总成本", v: fmtTotalCny(stats.total_real_cost_cny), c: "", h: "费用 × 上游倍率 折算的人民币成本" },
       ];
       const render = (cards) => cards.map((c) =>
-        `<div class="stat"><div class="lbl">${c.l}</div><div class="num ${c.c}">${c.v}</div></div>`
+        `<div class="stat"><div class="lbl">${c.l}${hint(c.h)}</div><div class="num ${c.c}">${c.v}</div></div>`
       ).join("");
       $("statUpstreams").innerHTML = render(upstreamCards);
       $("statRequests").innerHTML = render(requestCards);

@@ -123,7 +123,7 @@
     function fmtCost(v) {
       if (!hasValue(v)) return "";
       const s = Number(v);
-      return "$" + s.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+      return "$" + s.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
     }
     function fmtUnitPrice(v) {
       if (!hasValue(v)) return "";
@@ -137,22 +137,23 @@
     }
     function fmtRealCost(v) {
       if (!hasValue(v)) return "";
-      const s = Number(v).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+      const s = Number(v).toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
       return "￥" + s;
     }
     function fmtTotalCny(v) {
       if (v == null) return "";
-      const s = Number(v).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+      const s = Number(v).toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
       return "￥" + s;
     }
     function feeCell(e) {
       const ok = e.status != null && Number(e.status) < 400;
       const breakdown = e.cost_breakdown && e.cost_breakdown.rows && e.cost_breakdown.rows.length;
+      const flag = cacheMissFlag(e);
       const costHtml = !hasValue(e.cost_usd)
         ? ""
         : (ok && breakdown
-            ? `<div class="fee-click">${fmtCost(e.cost_usd)}</div>`
-            : `<div>${fmtCost(e.cost_usd)}</div>`);
+            ? `<div class="fee-click">${fmtCost(e.cost_usd)}${flag}</div>`
+            : `<div>${fmtCost(e.cost_usd)}${flag}</div>`);
       const multHtml = `<div><span class="box green">${fmtMultiplier(e.multiplier)}</span></div>`;
       if (ok && breakdown) {
         return '<td class="cell-2l" data-fee="1" title="点击查看费用明细">' + costHtml + multHtml + "</td>";
@@ -257,6 +258,11 @@
         `<span class="vbar">${barClass(ttftOk ? "ok" : "warn")}${barClass(durColor)}</span>` +
         '<span class="vbody">' + lines.join("") + "</span></td>";
     }
+    function cacheMissFlag(e) {
+      if (!e || !e.is_cache_miss) return "";
+      const extra = hasValue(e.cache_miss_extra_usd) ? fmtMoney(e.cache_miss_extra_usd) : "";
+      return `<span class="cm-flag" title="掉缓存 ${fmtTok(e.cache_miss_tokens)} tokens · 多花 ${extra}">!</span>`;
+    }
     function tokensCell(e) {
       const parts = [];
       const inParts = [];
@@ -269,6 +275,7 @@
       if (hasValue(e.cached_tokens)) {
         inParts.push(`<span class="box green">缓存 ${fmtTok(e.cached_tokens)}</span>`);
       }
+      if (e.is_cache_miss) inParts.push(cacheMissFlag(e));
       if (inParts.length) parts.push(`<div>${inParts.join("")}</div>`);
       const outParts = [];
       if (hasValue(e.output_tokens)) {
