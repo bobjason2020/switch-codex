@@ -431,6 +431,8 @@ td[colspan] { text-align: center; color: var(--muted); padding: 34px 8px; }
 .box.sid-7 { background: rgba(247, 131, 172, 0.16); color: #faa2c1; border: 1px solid rgba(247, 131, 172, 0.28); }
 .box.sid-8 { background: rgba(56, 217, 169, 0.16); color: #63e6be; border: 1px solid rgba(56, 217, 169, 0.28); }
 .box.sid-9 { background: rgba(169, 227, 75, 0.16); color: #c0eb75; border: 1px solid rgba(169, 227, 75, 0.28); }
+.sid-cell { vertical-align: top; }
+.sid-line + .sid-line { margin-top: 3px; }
 /* 分类器标签：灰色低透明度，置于 effort 旁 */
 .box.box-cls { margin-left: 6px; padding: 0 5px; border-radius: 4px; font-size: 0.7rem; white-space: nowrap; background: rgba(148, 148, 148, 0.14); color: #bdbdbd; border: 1px solid rgba(148, 148, 148, 0.25); }
 /* 掉缓存：红色感叹号圆球，悬浮显示丢失缓存与多花金额 */
@@ -625,6 +627,7 @@ code { font-size: 0.85em; padding: 1px 5px; border-radius: 5px; background: rgba
 .stat:hover { transform: translateY(-2px); border-color: var(--border); box-shadow: var(--shadow); }
 .stat .lbl { color: var(--muted); font-size: 0.78rem; }
 .stat .num { font-size: 1.45rem; font-weight: 700; margin-top: 6px; letter-spacing: 0.01em; }
+.stat .num .stat-subvalue { color: var(--muted); font-size: 0.72em; font-weight: 500; }
 .stat .num.ok { color: var(--ok); }
 .stat .num.warn { color: var(--warn); }
 .stat .num.err { color: var(--danger); }

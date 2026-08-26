@@ -229,15 +229,20 @@
     }
     const sidColorMap = new Map();
     function sessionIdCell(e) {
-      const sid = e.session_id || "";
-      if (!sid) return "<td></td>";
-      let idx = sidColorMap.get(sid);
-      if (idx === undefined) {
-        idx = sidColorMap.size % 10;
-        sidColorMap.set(sid, idx);
-      }
-      const short = sid.length > 20 ? sid.slice(0, 10) + "…" + sid.slice(-6) : sid;
-      return `<td class="mono" style="font-size:0.75rem" title="${escapeHtml(sid)}"><span class="box sid-${idx}">${escapeHtml(short)}</span></td>`;
+      const rawPath = Array.isArray(e.session_path) ? e.session_path : [];
+      const path = rawPath.filter((sid, i) => sid && rawPath.indexOf(sid) === i);
+      if (!path.length && e.session_id) path.push(e.session_id);
+      if (!path.length) return "<td></td>";
+      const lines = path.map((sid) => {
+        let idx = sidColorMap.get(sid);
+        if (idx === undefined) {
+          idx = sidColorMap.size % 10;
+          sidColorMap.set(sid, idx);
+        }
+        const short = sid.length > 20 ? sid.slice(0, 10) + "…" + sid.slice(-6) : sid;
+        return `<div class="sid-line"><span class="box sid-${idx}">${escapeHtml(short)}</span></div>`;
+      }).join("");
+      return `<td class="mono sid-cell" style="font-size:0.75rem" title="${escapeHtml(path.join(" → "))}">${lines}</td>`;
     }
     function timeCell(e) {
       const hasTtft = hasValue(e.ttft_ms);
@@ -261,7 +266,8 @@
     function cacheMissFlag(e) {
       if (!e || !e.is_cache_miss) return "";
       const extra = hasValue(e.cache_miss_extra_usd) ? fmtMoney(e.cache_miss_extra_usd) : "";
-      return `<span class="cm-flag" title="掉缓存 ${fmtTok(e.cache_miss_tokens)} tokens · 多花 ${extra}">!</span>`;
+      const kind = e.cache_miss_type === "prefix_reset" ? "缓存前缀失配" : "掉缓存";
+      return `<span class="cm-flag" title="${kind} ${fmtTok(e.cache_miss_tokens)} tokens · 多花 ${extra}">!</span>`;
     }
     function tokensCell(e) {
       const parts = [];
