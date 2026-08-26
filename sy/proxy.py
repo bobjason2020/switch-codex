@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from sy import auth, core, logbook, probes, timeutil
-from sy.const import ERROR_LOG_ATTEMPT_BODY_MAX
+from sy.const import ERROR_LOG_ATTEMPT_BODY_MAX, LOG_STREAM_BUF_MAX
 
 log = logging.getLogger("switchyard.proxy")
 router = APIRouter()
@@ -52,6 +52,58 @@ _GENERATED_REQUEST_HEADERS = frozenset(
 _HOP_BY_HOP_RESPONSE_HEADERS = _HOP_BY_HOP_HEADERS | frozenset(
     {"content-length", "content-encoding", "host"}
 )
+
+MAX_CLIENT_REQUEST_BODY_BYTES = 16 * 1024 * 1024
+MAX_UPSTREAM_RESPONSE_BODY_BYTES = 32 * 1024 * 1024
+_READ_CHUNK_SIZE = 64 * 1024
+
+
+class _BodyTooLarge(ValueError):
+    """Raised when a buffered request or upstream response exceeds its limit."""
+
+
+def _content_length_exceeds(headers: Mapping[str, str], limit: int) -> bool:
+    raw = headers.get("content-length")
+    if not raw:
+        return False
+    try:
+        return int(raw) > limit
+    except (TypeError, ValueError):
+        return False
+
+
+async def _read_request_body_limited(request: Request) -> bytes:
+    """Read the request body without allowing a chunked upload to grow unbounded."""
+    if _content_length_exceeds(request.headers, MAX_CLIENT_REQUEST_BODY_BYTES):
+        raise HTTPException(
+            status_code=413,
+            detail=f"Request body exceeds {MAX_CLIENT_REQUEST_BODY_BYTES} byte limit",
+        )
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > MAX_CLIENT_REQUEST_BODY_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Request body exceeds {MAX_CLIENT_REQUEST_BODY_BYTES} byte limit",
+            )
+    return bytes(body)
+
+
+async def _read_upstream_body_limited(response: httpx.Response) -> bytes:
+    """Read a non-streaming upstream response with a fixed memory ceiling."""
+    if _content_length_exceeds(response.headers, MAX_UPSTREAM_RESPONSE_BODY_BYTES):
+        raise _BodyTooLarge(
+            f"Upstream response exceeds {MAX_UPSTREAM_RESPONSE_BODY_BYTES} byte limit"
+        )
+    body = bytearray()
+    async for chunk in response.aiter_bytes(chunk_size=_READ_CHUNK_SIZE):
+        body.extend(chunk)
+        if len(body) > MAX_UPSTREAM_RESPONSE_BODY_BYTES:
+            raise _BodyTooLarge(
+                f"Upstream response exceeds {MAX_UPSTREAM_RESPONSE_BODY_BYTES} byte limit"
+            )
+    return bytes(body)
 
 
 def _forward_request_headers(headers: Mapping[str, str]) -> dict[str, str]:
@@ -140,8 +192,9 @@ def _safe_responses_path(path: str, method: str) -> str:
 class _SseLineBuffer:
     """按完整 UTF-8 行切 SSE，避免 chunk 截断 JSON。"""
 
-    def __init__(self) -> None:
+    def __init__(self, max_bytes: int = LOG_STREAM_BUF_MAX) -> None:
         self._buf = b""
+        self._max_bytes = max_bytes
 
     def feed(self, chunk: bytes) -> list[str]:
         if not chunk:
@@ -152,10 +205,20 @@ class _SseLineBuffer:
             nl = self._buf.find(b"\n")
             if nl < 0:
                 break
+            if nl > self._max_bytes:
+                self._buf = b""
+                raise _BodyTooLarge(
+                    f"Upstream SSE line exceeds {self._max_bytes} byte limit"
+                )
             raw, self._buf = self._buf[:nl], self._buf[nl + 1 :]
             if raw.endswith(b"\r"):
                 raw = raw[:-1]
             lines.append(raw.decode("utf-8", errors="replace"))
+        if len(self._buf) > self._max_bytes:
+            self._buf = b""
+            raise _BodyTooLarge(
+                f"Upstream SSE line exceeds {self._max_bytes} byte limit"
+            )
         return lines
 
     def flush(self) -> Optional[str]:
@@ -250,6 +313,7 @@ async def _forward_once(
     content_type: str,
     extra_headers: Mapping[str, str],
     *,
+    method: str = "POST",
     anthropic: bool = False,
 ) -> httpx.Response:
     """单上游纯透传：body 原样、模型名不改写、无协议转换。
@@ -274,10 +338,10 @@ async def _forward_once(
         "try upstream=%s pool=%s %s %s",
         upstream.get("name"),
         core.normalize_model(upstream.get("model")),
-        "POST",
+        method,
         url,
     )
-    req = client.build_request("POST", url, content=body, headers=headers)
+    req = client.build_request(method, url, content=body, headers=headers)
     return await client.send(req, stream=True)
 
 
@@ -302,12 +366,12 @@ async def proxy_responses(
     trust_proxy_headers = bool(public.get("trust_proxy_headers"))
     client_ip = _caller_ip(request, trust_proxy_headers)
     is_public_request = _is_public_request(request, trust_proxy_headers)
-    body = await request.body()
+    method = request.method.upper()
+    body = await _read_request_body_limited(request)
     content_type = request.headers.get("content-type", "application/json")
     extra = _forward_request_headers(request.headers)
     req_body, req_body_len, req_body_trunc = logbook._request_body_for_log(body)
 
-    method = request.method.upper()
     standalone_search = request.url.path == "/v1/alpha/search"
     path_suffix = "alpha/search" if standalone_search else _safe_responses_path(path, method)
     log_path = (
@@ -458,7 +522,7 @@ async def proxy_responses(
     client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
     try:
         resp = await _forward_once(
-            client, upstream, path_suffix, body, content_type, extra
+            client, upstream, path_suffix, body, content_type, extra, method=method
         )
     except Exception as e:
         await client.aclose()
@@ -577,7 +641,13 @@ async def proxy_responses(
 
         # 非流式（含 standalone search 的 JSON 信封）：读 body 透传 + 提取 usage。
         upstream_headers = _upstream_response_headers(resp)
-        raw = await resp.aread()
+        try:
+            raw = await _read_upstream_body_limited(resp)
+        except _BodyTooLarge as e:
+            await _aclose_quietly(resp, client)
+            eid = record_error(status=502, error=str(e), attempts=list(errors))
+            record(status=502, error_log_id=eid, attempts=list(errors))
+            return JSONResponse(status_code=502, content={"detail": str(e)})
         await resp.aclose()
         usage = logbook._extract_usage(raw)
         if client_model:
@@ -614,7 +684,15 @@ async def proxy_responses(
 
     # 上游错误（>=400）：如实返回，不做 failover。
     upstream_headers = _upstream_response_headers(resp)
-    err_text = (await resp.aread()).decode("utf-8", errors="replace")
+    try:
+        err_text = (await _read_upstream_body_limited(resp)).decode(
+            "utf-8", errors="replace"
+        )
+    except _BodyTooLarge as e:
+        await _aclose_quietly(resp, client)
+        eid = record_error(status=502, error=str(e), attempts=list(errors))
+        record(status=502, error_log_id=eid, attempts=list(errors))
+        return JSONResponse(status_code=502, content={"detail": str(e)})
     await resp.aclose()
     log.warning(
         "upstream=%s status=%s body=%s",
@@ -684,7 +762,7 @@ async def proxy_anthropic_messages(
     trust_proxy_headers = bool(public.get("trust_proxy_headers"))
     client_ip = _caller_ip(request, trust_proxy_headers)
     is_public_request = _is_public_request(request, trust_proxy_headers)
-    body = await request.body()
+    body = await _read_request_body_limited(request)
     content_type = request.headers.get("content-type", "application/json")
     extra = _forward_request_headers(request.headers)
 
@@ -838,7 +916,14 @@ async def proxy_anthropic_messages(
     client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
     try:
         resp = await _forward_once(
-            client, upstream, "messages", body, content_type, extra, anthropic=True
+            client,
+            upstream,
+            "messages",
+            body,
+            content_type,
+            extra,
+            method=method,
+            anthropic=True,
         )
     except Exception as e:
         await client.aclose()
@@ -956,7 +1041,13 @@ async def proxy_anthropic_messages(
 
         # 非流式：读 body 透传 + 提取 usage。
         upstream_headers = _upstream_response_headers(resp)
-        raw = await resp.aread()
+        try:
+            raw = await _read_upstream_body_limited(resp)
+        except _BodyTooLarge as e:
+            await _aclose_quietly(resp, client)
+            eid = record_error(status=502, error=str(e), attempts=list(errors))
+            record(status=502, error_log_id=eid, attempts=list(errors))
+            return JSONResponse(status_code=502, content={"detail": str(e)})
         await resp.aclose()
         usage = logbook._extract_usage(raw)
         if client_model:
@@ -992,7 +1083,15 @@ async def proxy_anthropic_messages(
 
     # 上游错误（>=400）：如实返回（Anthropic 原生上游错误体本身就是 Anthropic 格式）。
     upstream_headers = _upstream_response_headers(resp)
-    err_text = (await resp.aread()).decode("utf-8", errors="replace")
+    try:
+        err_text = (await _read_upstream_body_limited(resp)).decode(
+            "utf-8", errors="replace"
+        )
+    except _BodyTooLarge as e:
+        await _aclose_quietly(resp, client)
+        eid = record_error(status=502, error=str(e), attempts=list(errors))
+        record(status=502, error_log_id=eid, attempts=list(errors))
+        return JSONResponse(status_code=502, content={"detail": str(e)})
     await resp.aclose()
     log.warning(
         "upstream=%s status=%s body=%s",

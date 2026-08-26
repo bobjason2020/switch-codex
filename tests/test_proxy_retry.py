@@ -5,10 +5,18 @@ import unittest
 
 import asyncio
 import httpx
+from fastapi import HTTPException
+from starlette.requests import Request
+from unittest.mock import patch
 
 from sy.proxy import (
+    MAX_UPSTREAM_RESPONSE_BODY_BYTES,
+    _BodyTooLarge,
+    _SseLineBuffer,
     _forward_once,
     _forward_request_headers,
+    _read_request_body_limited,
+    _read_upstream_body_limited,
     _upstream_response_headers,
 )
 
@@ -101,6 +109,8 @@ class HeaderForwardingTests(unittest.TestCase):
             self.assertEqual(seen["headers"]["session_id"], "session-1")
             self.assertEqual(seen["url"], "https://upstream.example/v1/responses")
 
+        asyncio.run(run())
+
     def test_forward_once_anthropic_uses_x_api_key(self):
         async def run():
             seen = {}
@@ -130,6 +140,84 @@ class HeaderForwardingTests(unittest.TestCase):
             self.assertEqual(seen["headers"]["x-api-key"], "anthropic-key")
             self.assertEqual(seen["headers"]["anthropic-version"], "2023-06-01")
             self.assertEqual(seen["url"], "https://upstream.example/messages")
+
+        asyncio.run(run())
+
+    def test_forward_once_preserves_get_and_delete_methods(self):
+        async def run():
+            seen = []
+
+            def handler(request):
+                seen.append(request.method)
+                return httpx.Response(200, request=request)
+
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            try:
+                for method in ("GET", "DELETE"):
+                    response = await _forward_once(
+                        client,
+                        {
+                            "base_url": "https://upstream.example/v1",
+                            "api_key": "upstream-key",
+                            "model": "openai",
+                        },
+                        "responses/resp_123",
+                        b"",
+                        "application/json",
+                        {},
+                        method=method,
+                    )
+                    await response.aclose()
+            finally:
+                await client.aclose()
+            self.assertEqual(seen, ["GET", "DELETE"])
+
+        asyncio.run(run())
+
+    def test_request_body_reader_rejects_chunked_overflow(self):
+        async def run():
+            chunks = iter([b"ab", b"cd", b""])
+
+            async def receive():
+                chunk = next(chunks)
+                return {"type": "http.request", "body": chunk, "more_body": bool(chunk)}
+
+            request = Request(
+                {"type": "http", "method": "POST", "path": "/", "headers": []},
+                receive,
+            )
+            with patch("sy.proxy.MAX_CLIENT_REQUEST_BODY_BYTES", 3):
+                with self.assertRaises(HTTPException) as raised:
+                    await _read_request_body_limited(request)
+            self.assertEqual(raised.exception.status_code, 413)
+
+        asyncio.run(run())
+
+    def test_sse_line_buffer_rejects_unbounded_line(self):
+        buf = _SseLineBuffer(max_bytes=3)
+        with self.assertRaises(_BodyTooLarge):
+            buf.feed(b"abcd")
+
+    def test_upstream_body_reader_rejects_declared_and_chunked_overflow(self):
+        async def run():
+            declared = httpx.Response(
+                200,
+                headers={"content-length": str(MAX_UPSTREAM_RESPONSE_BODY_BYTES + 1)},
+                content=b"x",
+            )
+            with self.assertRaises(_BodyTooLarge):
+                await _read_upstream_body_limited(declared)
+
+            class Stream(httpx.AsyncByteStream):
+                async def __aiter__(self):
+                    yield b"x" * (MAX_UPSTREAM_RESPONSE_BODY_BYTES // 2)
+                    yield b"x" * (MAX_UPSTREAM_RESPONSE_BODY_BYTES // 2 + 1)
+
+            chunked = httpx.Response(200, stream=Stream())
+            with self.assertRaises(_BodyTooLarge):
+                await _read_upstream_body_limited(chunked)
+
+        asyncio.run(run())
 
 
 if __name__ == "__main__":
