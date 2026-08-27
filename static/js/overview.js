@@ -506,7 +506,7 @@
         { l: "掉缓存多花", v: cacheMissExtraValue, c: stats.cache_miss_extra_usd ? "warn" : "", h: "因掉缓存相对「缓存正常续上」多花的费用(USD);括号为其占总费用的比例" },
         { l: "平均首字", v: fmtDur(stats.avg_ttft_ms), c: "", h: "平均首 token 延迟(TTFT)" },
         { l: "平均用时", v: fmtDur(stats.avg_duration_ms), c: "", h: "平均请求总耗时" },
-        { l: "平均TPS", v: fmtTps(stats.avg_tps), c: "", h: "每秒输出 tokens = 输出 tokens ÷ 耗时(已含推理)" },
+        { l: "平均TPS", v: fmtTps(stats.avg_tps), c: "", h: "每秒输出 tokens = 输出 tokens ÷ (总耗时 − 首包耗时)" },
         { l: "总费用", v: fmtOverviewMoney(stats.total_cost), c: "", h: "按配置单价计算的 USD 费用" },
         { l: "总成本", v: fmtOverviewCny(stats.total_real_cost_cny), c: "", h: "费用 × 上游倍率 折算的人民币成本" },
       ];

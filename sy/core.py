@@ -952,16 +952,30 @@ def cost_breakdown(entry: dict) -> Optional[dict]:
     }
 
 
-def compute_tps(entry: dict) -> Optional[float]:
+def tps_output_seconds(entry: dict) -> Optional[float]:
     duration_ms = entry.get("duration_ms")
-    output = entry.get("output_tokens")
-    if not duration_ms or output is None:
+    ttft_ms = entry.get("ttft_ms")
+    if duration_ms is None or ttft_ms is None:
         return None
-    tokens = int(output or 0)
+    try:
+        secs = (float(duration_ms) - float(ttft_ms)) / 1000.0
+    except (TypeError, ValueError):
+        return None
+    return secs if secs > 0 else None
+
+
+def compute_tps(entry: dict) -> Optional[float]:
+    output = entry.get("output_tokens")
+    if output is None:
+        return None
+    try:
+        tokens = int(output)
+    except (TypeError, ValueError):
+        return None
     if tokens <= 0:
         return None
-    secs = float(duration_ms) / 1000.0
-    if secs <= 0:
+    secs = tps_output_seconds(entry)
+    if secs is None:
         return None
     return round(tokens / secs, 1)
 

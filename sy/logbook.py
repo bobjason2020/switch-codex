@@ -1027,13 +1027,15 @@ def _aggregate_stats(items: list[dict], now: datetime) -> dict:
             cm_real = core.compute_real_cost_cny(e, cost_usd=cm_extra)
             if cm_real is not None:
                 cache_miss_extra_cny += cm_real
-        d = e.get("duration_ms")
-        if d is not None:
+        output_seconds = core.tps_output_seconds(e)
+        if output_seconds is not None:
             try:
                 # Anthropic/OpenAI 的 output_tokens 已包含 reasoning/thinking，
                 # 不再额外相加（借鉴 cc-switch TokenUsage 语义）。
-                tps_tokens += int(e.get("output_tokens") or 0)
-                tps_seconds += float(d) / 1000.0
+                output_tokens = int(e.get("output_tokens") or 0)
+                if output_tokens > 0:
+                    tps_tokens += output_tokens
+                    tps_seconds += output_seconds
             except (TypeError, ValueError):
                 pass
         st = e.get("status")
