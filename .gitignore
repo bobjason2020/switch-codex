@@ -19,3 +19,6 @@ data/
 
 # One-off local maintenance script (not part of the public project)
 scripts/backfill_interrupted_streams.py
+
+# Local agent instructions
+/AGENTS.md
