@@ -25,7 +25,32 @@
 
     function showMsg(text, ok) {
       msg.className = "banner " + (ok ? "ok" : "err");
-      msg.textContent = text;
+      msg.replaceChildren();
+      const raw = String(text == null ? "" : text);
+      const looksLikeHtml = /<!doctype\s+html|<html[\s>]/i.test(raw);
+      const needsCollapse = !ok && (
+        looksLikeHtml || raw.length > 600 || raw.split("\n").length > 10
+      );
+      if (!needsCollapse) {
+        msg.textContent = raw;
+      } else {
+        const summary = document.createElement("span");
+        summary.textContent = looksLikeHtml
+          ? "上游返回了 HTML 网关错误（可能是 Cloudflare 502）"
+          : raw.slice(0, 600) + (raw.length > 600 ? "…" : "");
+        msg.appendChild(summary);
+
+        const details = document.createElement("details");
+        details.className = "banner-details";
+        const label = document.createElement("summary");
+        label.textContent = "展开详情";
+        const body = document.createElement("pre");
+        body.textContent = raw.slice(0, 65536) + (
+          raw.length > 65536 ? "\n...[已截断]" : ""
+        );
+        details.append(label, body);
+        msg.appendChild(details);
+      }
       if (ok) setTimeout(() => { msg.className = "banner"; }, 4000);
     }
 
