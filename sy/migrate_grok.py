@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 from sy import db
 from sy.grok_sync import _parse_config, _read_config_text
 from sy.const import (
+    DEFAULT_PRICING,
     GROK_CLIENT_MODELS,
     GROK_DEFAULT_MODEL_MAP,
     GROK_DEFAULT_PRICING,
@@ -75,7 +76,8 @@ def _ensure_grok_pricing() -> list[str]:
     pricing = cfg.get("pricing") if isinstance(cfg.get("pricing"), dict) else {}
     added: list[str] = []
     for model, vals in GROK_DEFAULT_PRICING.items():
-        if model not in pricing:
+        # 已进 DEFAULT_PRICING 的模型由内置默认价兜底，不再往库里 seed 覆盖项
+        if model not in pricing and model not in DEFAULT_PRICING:
             pricing[model] = dict(vals)
             added.append(model)
     if added:

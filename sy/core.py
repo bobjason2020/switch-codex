@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import copy
 import ipaddress
 import logging
 import math
@@ -22,6 +23,7 @@ from sy.const import (
     DEFAULT_MASTER_KEY,
     DEFAULT_MODEL,
     DEFAULT_OPENAI_ALL_MODEL_MAP,
+    DEFAULT_PRICING,
     DEFAULT_PROBE_INTERVAL_SEC,
     DEEPSEEK_CLIENT_MODELS,
     DEEPSEEK_DEFAULT_MODEL_MAP,
@@ -750,13 +752,41 @@ def _float_or_none(value: Any) -> Optional[float]:
         return None
 
 
+def default_pricing() -> dict:
+    """内置默认单价的深拷贝，调用方可以随意改。"""
+    return copy.deepcopy(DEFAULT_PRICING)
+
+
 def load_pricing() -> dict:
-    return load_config().get("pricing") or {}
+    """内置默认单价 + 数据库覆盖。
+
+    数据库 config.pricing 里存在同名模型时整条替换默认值（而不是按字段合并），
+    这样在面板里清掉某个字段就是真的清掉，不会被默认值补回来。数据库没写过的
+    模型直接用 DEFAULT_PRICING，保证仓库 clone 下来就有正确单价。
+    """
+    merged = copy.deepcopy(DEFAULT_PRICING)
+    stored = load_config().get("pricing")
+    if isinstance(stored, dict):
+        for key, vals in stored.items():
+            k = str(key or "").strip()
+            if not k or not isinstance(vals, dict):
+                continue
+            merged[k] = copy.deepcopy(vals)
+    return merged
 
 
 def save_pricing(pricing: dict) -> None:
+    """只把与内置默认不同的条目写库，与默认一致的继续跟随 DEFAULT_PRICING。"""
+    overrides: dict[str, dict] = {}
+    for key, vals in (pricing or {}).items():
+        k = str(key or "").strip()
+        if not k or not isinstance(vals, dict):
+            continue
+        if DEFAULT_PRICING.get(k) == vals:
+            continue
+        overrides[k] = vals
     cfg = load_config()
-    cfg["pricing"] = pricing
+    cfg["pricing"] = overrides
     save_config(cfg)
 
 

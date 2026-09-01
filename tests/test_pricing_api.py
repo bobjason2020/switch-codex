@@ -13,7 +13,7 @@ def _run(body):
     saved = {}
     with mock.patch.object(
         core, "save_pricing", side_effect=lambda p: saved.update(p or {})
-    ):
+    ), mock.patch.object(core, "load_pricing", return_value={}):
         asyncio.run(set_pricing(PricingIn(pricing=body)))
     return saved
 

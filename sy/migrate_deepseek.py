@@ -5,7 +5,12 @@ import logging
 from typing import Any
 
 from sy import db
-from sy.const import DEFAULT_MODEL, DEEPSEEK_CLIENT_MODELS, DEEPSEEK_POOL
+from sy.const import (
+    DEFAULT_MODEL,
+    DEFAULT_PRICING,
+    DEEPSEEK_CLIENT_MODELS,
+    DEEPSEEK_POOL,
+)
 
 log = logging.getLogger("switchyard.migrate_deepseek")
 
@@ -69,7 +74,8 @@ def migrate() -> dict:
     changed_cfg = False
 
     pricing = cfg.get("pricing") if isinstance(cfg.get("pricing"), dict) else {}
-    if "deepseek-v4-pro" not in pricing:
+    # deepseek-v4-pro 已进 DEFAULT_PRICING，由内置默认价兜底，无需再 seed 覆盖项
+    if "deepseek-v4-pro" not in pricing and "deepseek-v4-pro" not in DEFAULT_PRICING:
         pricing["deepseek-v4-pro"] = {
             "input_per_m": 3.0,
             "output_per_m": 6.0,

@@ -91,6 +91,10 @@ SW_HOST=0.0.0.0 SW_PORT=4100 ./scripts/start.sh
 > 默认开箱配置中的 `openai-all` 池与 `gpt-5.6-luna / terra / sol` 客户端模型只是示例，
 > 便于首次启动就能跑通路由与可用性看板。实际使用时请按自己的上游和模型名修改：
 > 模型池、上游 Base URL / API Key、模型映射与单价都在管理后台配置。
+>
+> 单价有内置默认值（`sy/const.py: DEFAULT_PRICING`，含 gpt-5.6-luna/terra/sol、
+> deepseek-v4-flash/pro、grok-4.6 的基础价与长文本档），clone 下来空库启动即可正确算账，
+> 不用手工填。后台改过的模型只把差异写进数据库覆盖默认值；改回默认值后覆盖项自动清掉。
 
 官方 TARGET keys：`model`、`model_provider`（本路由固定为 `simple` 以便走 4100）、`preferred_auth_method`、`forced_login_method`、`model_reasoning_effort=high`、`model_catalog_json`。
 官方 DEL_B 等冲突项（`model_context_window`、`plan_mode_reasoning_effort`、`xhigh` 等）在 DeepSeek 模式下删除。
@@ -237,8 +241,8 @@ static/
 | GET | `/api/errors` | 错误日志（`limit/offset/range/start/end/pool/model/q`，时间范围同 `/api/logs`；每条含状态、每个上游的尝试结果与是否切换、请求体大小；保留 24h） |
 | GET | `/api/errors/{id}` | 错误详情（含完整请求体与每次尝试的完整错误响应） |
 | DELETE | `/api/errors` | 清空错误日志 |
-| GET | `/api/pricing` | 各模型池单价（USD/1M tokens） |
-| PUT | `/api/pricing` | 更新单价：`{"pricing":{"deepseek-v4-flash":{"input_per_m":0.28,"cache_read_per_m":0.028,"output_per_m":0.42}}}` |
+| GET | `/api/pricing` | 各模型池单价（USD/1M tokens），= `sy/const.py: DEFAULT_PRICING` 内置默认价 + 数据库覆盖 |
+| PUT | `/api/pricing` | 更新单价：`{"pricing":{"deepseek-v4-flash":{"input_per_m":0.28,"cache_read_per_m":0.028,"output_per_m":0.42}}}`；与默认价一致的条目不落库，改回默认即恢复跟随 |
 | GET | `/api/newapi-probes` | NewAPI 探测任务列表（Token 脱敏 + 最近状态 + 可选上游名） |
 | POST | `/api/newapi-probes` | 新增探测任务 |
 | PUT | `/api/newapi-probes/{id}` | 修改探测任务（间隔 / 分组 / 上游 / Token 等） |

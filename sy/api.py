@@ -813,7 +813,8 @@ async def set_pricing(body: PricingIn, _: str = Depends(auth.require_master)):
             cleaned[str(pool).strip()] = d
     core.save_pricing(cleaned)
     log.info("pricing updated pools=%s", list(cleaned))
-    return {"pricing": cleaned}
+    # 回默认价的条目不写库，返回合并后的生效单价而不是提交值
+    return {"pricing": core.load_pricing()}
 
 
 @router.get("/api/logs/models")

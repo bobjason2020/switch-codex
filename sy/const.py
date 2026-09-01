@@ -1,6 +1,7 @@
 """Switch-codex 全局常量与默认值。"""
 import os
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "static"
@@ -82,6 +83,61 @@ DEFAULT_OPENAI_ALL_MODEL_MAP = [
     {"model": "gpt-5.6-terra", "actual": ""},
     {"model": "gpt-5.6-sol", "actual": ""},
 ]
+
+# 内置默认单价（USD / 1M tokens）：仓库 clone 下来即可直接算账，无需手工填。
+# 数据库 config.pricing 里只保存与这里不同的覆盖项；同名模型存在覆盖时整条替换。
+DEFAULT_PRICING: dict[str, dict[str, Any]] = {
+    "gpt-5.6-luna": {
+        "input_per_m": 0.2,
+        "output_per_m": 1.2,
+        "cache_read_per_m": 0.025,
+        "cache_creation_per_m": 0.25,
+        "long_context": {
+            "threshold": 272000,
+            "input_per_m": 0.4,
+            "output_per_m": 1.8,
+            "cache_read_per_m": 0.05,
+            "cache_creation_per_m": 0.5,
+        },
+    },
+    "gpt-5.6-terra": {
+        "input_per_m": 2.0,
+        "output_per_m": 12.0,
+        "cache_read_per_m": 0.25,
+        "cache_creation_per_m": 2.5,
+        "long_context": {
+            "threshold": 272000,
+            "input_per_m": 4.0,
+            "output_per_m": 18.0,
+            "cache_read_per_m": 0.5,
+            "cache_creation_per_m": 5.0,
+        },
+    },
+    "gpt-5.6-sol": {
+        "input_per_m": 5.0,
+        "output_per_m": 30.0,
+        "cache_read_per_m": 0.5,
+        "cache_creation_per_m": 6.25,
+        "long_context": {
+            "threshold": 272000,
+            "input_per_m": 10.0,
+            "output_per_m": 45.0,
+            "cache_read_per_m": 1.0,
+            "cache_creation_per_m": 12.5,
+        },
+    },
+    "deepseek-v4-flash": {
+        "input_per_m": 1.5,
+        "output_per_m": 4.5,
+        "cache_read_per_m": 0.05,
+    },
+    "deepseek-v4-pro": {
+        "input_per_m": 3.0,
+        "output_per_m": 9.0,
+        "cache_read_per_m": 0.1,
+    },
+    **{model: dict(vals) for model, vals in GROK_DEFAULT_PRICING.items()},
+}
 
 # NewAPI 最低扣费：1 quota = $1 / 500000
 MIN_REAL_COST = 0.000002
