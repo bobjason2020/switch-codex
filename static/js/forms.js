@@ -130,20 +130,11 @@
     }
 
     function defaultModelMapForType(type) {
-      if (type === DEFAULT_MODEL) {
-        return [
-          { model: "gpt-5.6-luna", actual: "" },
-          { model: "gpt-5.6-terra", actual: "" },
-          { model: "gpt-5.6-sol", actual: "" },
-        ];
-      }
-      if (type === "deepseek") {
-        return DEEPSEEK_CLIENT_MODELS.map((m) => ({ model: m, actual: "" }));
-      }
-      if (type === "grok") {
-        return GROK_CLIENT_MODELS.map((m) => ({ model: m, actual: "" }));
-      }
-      return [];
+      const pool = type === DEFAULT_MODEL ? DEFAULT_MODEL : type;
+      return (defaultModelMaps[pool] || []).map((entry) => ({
+        model: entry.model,
+        actual: "",
+      }));
     }
 
     function addModelMapRow(entry) {
@@ -354,7 +345,7 @@
       authMustChange = !!st.must_change;
       if (authMustChange) { showChangePw(); return; }
       appBooted = true;
-      fillModelSelect($("activeModel"), DEFAULT_MODEL, true);
+      fillModelSelect($("activeModel"), DEFAULT_CLIENT_MODEL, true);
       fillPoolSelect($("modelSelect"), DEFAULT_MODEL);
       checkHealth();
       refreshModels()
@@ -364,9 +355,11 @@
 
     async function refreshModels() {
       const data = await api("/api/models");
+      defaultModelMaps = data.default_model_maps || {};
       knownModels = (data.data || []).map((x) => x.model);
       knownPools = (data.pools || []).map((x) => x.model);
       if (!knownModels.includes(DEFAULT_MODEL)) knownModels.unshift(DEFAULT_MODEL);
+      if (!knownModels.includes(DEFAULT_CLIENT_MODEL)) knownModels.push(DEFAULT_CLIENT_MODEL);
       if (!knownPools.includes(DEFAULT_MODEL)) knownPools.unshift(DEFAULT_MODEL);
       if (!knownPools.includes(DEEPSEEK_POOL)) knownPools.unshift(DEEPSEEK_POOL);
       modelCounts = {};
@@ -375,7 +368,7 @@
         modelCounts[x.model] = x.enabled_upstreams || 0;
         modelSync[x.model] = x.codex_sync || "";
       }
-      activeModel = data.active_model || DEFAULT_MODEL;
+      activeModel = data.active_model || DEFAULT_CLIENT_MODEL;
       codexStatus = data.codex || {};
       claudeStatus = data.claude || {};
       grokStatus = data.grok || {};

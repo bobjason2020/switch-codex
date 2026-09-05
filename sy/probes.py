@@ -21,6 +21,7 @@ from sy import core, db, logbook, state, timeutil
 from sy.const import (
     DEEPSEEK_CLIENT_MODELS,
     DEEPSEEK_POOL,
+    DEFAULT_CLIENT_MODEL,
     DEFAULT_MODEL,
     DEFAULT_NEWAPI_PROBE,
     DEFAULT_PROBE_INTERVAL_SEC,
@@ -185,7 +186,7 @@ def _probe_model_for_pool(umodel: str) -> str:
     """池名 -> 一个具体的代表客户端模型（避免把池名直接当模型名探测）。"""
     umodel = str(umodel or "").strip()
     if umodel == DEFAULT_MODEL:
-        return "gpt-5.6-sol"
+        return DEFAULT_CLIENT_MODEL
     if umodel == DEEPSEEK_POOL:
         return DEEPSEEK_CLIENT_MODELS[0]
     if umodel == GROK_POOL:
@@ -428,7 +429,7 @@ async def probe_standalone_web_search(
             "upstream": target.get("name"),
         }
     timeout = float(timeout or min(float(core.load_config().get("timeout_sec", 120)), 20.0))
-    model = core.upstream_request_model(target, "gpt-5.6-sol") or "gpt-5.6-sol"
+    model = core.upstream_request_model(target, DEFAULT_CLIENT_MODEL) or DEFAULT_CLIENT_MODEL
     # The endpoint rejects an otherwise valid request with an "empty calls"
     # error. Include the smallest real search command so capability probing
     # exercises the same protocol as production requests.

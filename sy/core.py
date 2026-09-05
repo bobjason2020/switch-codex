@@ -19,6 +19,7 @@ from fastapi import HTTPException
 from sy import claude_sync, codex_sync, db, grok_sync, state, timeutil
 from sy.const import (
     CACHE_PRIORITY_TTL_SEC,
+    DEFAULT_CLIENT_MODEL,
     DEFAULT_CLIENT_MODELS,
     DEFAULT_MASTER_KEY,
     DEFAULT_MODEL,
@@ -61,7 +62,7 @@ def load_config() -> dict:
         "host": env_host(),
         "port": env_port(),
         "timeout_sec": 120,
-        "active_model": DEFAULT_MODEL,
+        "active_model": DEFAULT_CLIENT_MODEL,
         "probe": probe,
     }
     for k, v in base.items():
@@ -70,7 +71,7 @@ def load_config() -> dict:
         cfg.setdefault(k, v)
     cfg["probe"] = probe
     if not str(cfg.get("active_model") or "").strip():
-        cfg["active_model"] = DEFAULT_MODEL
+        cfg["active_model"] = DEFAULT_CLIENT_MODEL
     if not str(cfg.get("master_key") or "").strip():
         cfg["master_key"] = DEFAULT_MASTER_KEY
         try:
@@ -352,6 +353,8 @@ def pool_for_client_model(client_model: str) -> str:
     m = str(client_model or "").strip()
     if not m:
         return DEFAULT_MODEL
+    if m in DEFAULT_CLIENT_MODELS:
+        return DEFAULT_MODEL
     if m == DEEPSEEK_POOL or codex_sync.is_deepseek_model(m):
         return DEEPSEEK_POOL
     if m == GROK_POOL or grok_sync.is_grok_model(m):
@@ -371,6 +374,8 @@ def resolve_route_pool(
         return pool_for_client_model(cm)
     active = normalize_model(active_model or load_config().get("active_model"))
     if active == codex_sync.LOCAL_DIRECT:
+        return DEFAULT_MODEL
+    if active in DEFAULT_CLIENT_MODELS:
         return DEFAULT_MODEL
     if active == DEEPSEEK_POOL or codex_sync.is_deepseek_model(active):
         return DEEPSEEK_POOL
@@ -1054,7 +1059,7 @@ def public_upstream(u: dict, health_map: Optional[dict[str, dict]] = None) -> di
 def _apply_active_model(active: str) -> dict[str, Any]:
     active = normalize_model(active)
     items = load_upstreams()
-    known = set(collect_models(items)) | set(DEEPSEEK_CLIENT_MODELS)
+    known = set(collect_models(items)) | set(DEEPSEEK_CLIENT_MODELS) | set(DEFAULT_CLIENT_MODELS)
     if active != codex_sync.LOCAL_DIRECT and active not in known:
         raise HTTPException(
             status_code=400,
@@ -1084,6 +1089,14 @@ def _apply_active_model(active: str) -> dict[str, Any]:
             for u in items
             if u.get("enabled", True)
             and normalize_model(u.get("model")) == DEEPSEEK_POOL
+            and upstream_supports_model(u, active)
+        ]
+    elif active in DEFAULT_CLIENT_MODELS:
+        scoped = [
+            u
+            for u in items
+            if u.get("enabled", True)
+            and normalize_model(u.get("model")) == DEFAULT_MODEL
             and upstream_supports_model(u, active)
         ]
     else:

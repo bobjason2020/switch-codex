@@ -77,11 +77,18 @@ GROK_DEFAULT_PRICING = {
 }
 DEFAULT_PROBE_INTERVAL_SEC = 300
 PROBE_MULTIPLIER_THRESHOLD = 0.1
-DEFAULT_CLIENT_MODELS = ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol")
+DEFAULT_CLIENT_MODELS = (
+    "gpt-5.6-luna",
+    "gpt-5.6-terra",
+    "gpt-5.6-sol",
+    "gpt-6-astra",
+)
+DEFAULT_CLIENT_MODEL = DEFAULT_CLIENT_MODELS[-1]
 DEFAULT_OPENAI_ALL_MODEL_MAP = [
     {"model": "gpt-5.6-luna", "actual": ""},
     {"model": "gpt-5.6-terra", "actual": ""},
     {"model": "gpt-5.6-sol", "actual": ""},
+    {"model": "gpt-6-astra", "actual": ""},
 ]
 
 # 内置默认单价（USD / 1M tokens）：仓库 clone 下来即可直接算账，无需手工填。
@@ -126,6 +133,12 @@ DEFAULT_PRICING: dict[str, dict[str, Any]] = {
             "cache_creation_per_m": 12.5,
         },
     },
+    "gpt-6-astra": {
+        "input_per_m": 10.0,
+        "output_per_m": 60.0,
+        "cache_read_per_m": 1.0,
+        "cache_creation_per_m": 12.5,
+    },
     "deepseek-v4-flash": {
         "input_per_m": 1.5,
         "output_per_m": 4.5,
@@ -168,7 +181,7 @@ DEFAULT_CONFIG = {
     "host": env_host(),
     "port": env_port(),
     "timeout_sec": 120,
-    "active_model": DEFAULT_MODEL,
+    "active_model": DEFAULT_CLIENT_MODEL,
     "probe": {
         "interval_sec": DEFAULT_PROBE_INTERVAL_SEC,
         "models": {},

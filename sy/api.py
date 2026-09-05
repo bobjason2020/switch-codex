@@ -13,12 +13,18 @@ from pydantic import BaseModel, Field
 from sy import auth, claude_sync, codex_sync, core, db, grok_sync, logbook, probes, state, timeutil
 from sy.const import (
     COLOR_BAD,
+    DEFAULT_CLIENT_MODEL,
+    DEFAULT_CLIENT_MODELS,
+    DEFAULT_OPENAI_ALL_MODEL_MAP,
     DEFAULT_MODEL,
     DEFAULT_NEWAPI_PROBE,
     DEFAULT_PROBE_INTERVAL_SEC,
     DEEPSEEK_CLIENT_MODELS,
+    DEEPSEEK_DEFAULT_MODEL_MAP,
     DEEPSEEK_POOL,
     ERROR_LOG_RETENTION_HOURS,
+    GROK_DEFAULT_MODEL_MAP,
+    GROK_POOL,
     PROBE_MULTIPLIER_THRESHOLD,
 )
 
@@ -259,6 +265,7 @@ async def list_models(_: str = Depends(auth.require_master)):
     data = [
         entry(DEFAULT_MODEL, DEFAULT_MODEL, True, "restore"),
         entry(DEEPSEEK_POOL, DEEPSEEK_POOL, False, "official-deepseek"),
+        entry(DEFAULT_CLIENT_MODEL, DEFAULT_MODEL, False, "default"),
     ]
 
     pools = core.collect_models(items)
@@ -272,6 +279,11 @@ async def list_models(_: str = Depends(auth.require_master)):
         "data": data,
         "pools": pool_rows,
         "active_model": core.normalize_model(cfg.get("active_model")),
+        "default_model_maps": {
+            DEFAULT_MODEL: core.normalize_model_map(DEFAULT_OPENAI_ALL_MODEL_MAP),
+            DEEPSEEK_POOL: core.normalize_model_map(DEEPSEEK_DEFAULT_MODEL_MAP),
+            GROK_POOL: core.normalize_model_map(GROK_DEFAULT_MODEL_MAP),
+        },
         "probe_interval_sec": core.probe_interval_sec(cfg),
         "codex": codex_sync.status(),
         "claude": claude_sync.status(),
@@ -550,11 +562,7 @@ async def create_upstream(body: UpstreamIn, _: str = Depends(auth.require_master
         "priority": int(body.priority),
         "enabled": bool(body.enabled),
         "model": model,
-        "model_map": (
-            core.normalize_model_map(body.model_map)
-            if body.model_map is not None
-            else core.default_model_map_for(model)
-        ),
+        "model_map": core.normalize_model_map(body.model_map) or core.default_model_map_for(model),
         "multiplier": multiplier,
         "probe_enabled": probe_enabled,
         "chat_completions": bool(body.chat_completions),
@@ -593,7 +601,7 @@ async def update_upstream(uid: str, body: UpstreamUpdate, _: str = Depends(auth.
             if "model" in data and data["model"] is not None:
                 u["model"] = core.normalize_model(data["model"])
             if "model_map" in data and data["model_map"] is not None:
-                u["model_map"] = core.normalize_model_map(data["model_map"])
+                u["model_map"] = core.normalize_model_map(data["model_map"]) or core.default_model_map_for(u.get("model"))
             elif u.get("model") != old_model:
                 # Pool renamed → reset to the new pool's default model list.
                 u["model_map"] = core.default_model_map_for(u.get("model"))
@@ -632,7 +640,7 @@ async def delete_upstream(uid: str, _: str = Depends(auth.require_master)):
 
     cfg = core.load_config()
     active = core.normalize_model(cfg.get("active_model"))
-    known = set(core.collect_models(new_items)) | set(DEEPSEEK_CLIENT_MODELS)
+    known = set(core.collect_models(new_items)) | set(DEEPSEEK_CLIENT_MODELS) | set(DEFAULT_CLIENT_MODELS)
     if active != codex_sync.LOCAL_DIRECT and active not in known:
         # 只改路由默认池，不触发 Codex 同步（删光上游时不应覆盖 ~/.codex）。
         cfg["active_model"] = DEFAULT_MODEL

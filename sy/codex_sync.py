@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from sy import db as sr_db
-from sy.const import DEEPSEEK_CLIENT_MODELS, DEEPSEEK_POOL, provider_base_url
+from sy.const import DEFAULT_CLIENT_MODEL, DEEPSEEK_CLIENT_MODELS, DEEPSEEK_POOL, provider_base_url
 
 log = logging.getLogger("switchyard.codex_sync")
 
@@ -183,7 +183,17 @@ def _read_json(path: Path, default: Any) -> Any:
 def _copy_file_if_exists(src: Path, dst: Path) -> bool:
     if not src.exists():
         return False
-    _secure_mkdir(dst.parent)
+    data_root = DATA.resolve()
+    destination = dst.resolve()
+    if data_root in destination.parents or destination == data_root:
+        _secure_mkdir(dst.parent)
+    else:
+        # Codex configuration lives outside the project snapshot directory.
+        dst.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            dst.parent.chmod(0o700)
+        except OSError:
+            pass
     shutil.copy2(src, dst)
     try:
         dst.chmod(0o600)
@@ -491,7 +501,7 @@ def transform_config_toml(
 ) -> tuple[str, list[str]]:
     """Official-style surgery on config.toml. Returns (new_text, change_report)."""
     is_ds = mode == "deepseek"
-    targets = TARGET_KEYS if is_ds else ("model_provider",)
+    targets = TARGET_KEYS if is_ds else ("model", "model_provider")
     lines = text.splitlines()
     out: list[str] = []
     report: list[str] = []
@@ -549,8 +559,7 @@ def transform_config_toml(
             k = _key_of(line) if not mlstate and depth == 0 else ""
             # Update model inside [model_providers.simple]
             if (
-                is_ds
-                and cur_section == "model_providers.simple"
+                cur_section == "model_providers.simple"
                 and k == "model"
                 and not mlstate
                 and depth == 0
@@ -692,7 +701,7 @@ def apply_openai_all() -> dict[str, Any]:
     else:
         base_text = _read_text_file(config_path()) if config_path().exists() else ""
 
-    new_text, report = transform_config_toml(base_text, DEFAULT_MODEL, mode="openai-all")
+    new_text, report = transform_config_toml(base_text, DEFAULT_CLIENT_MODEL, mode="openai-all")
     _atomic_write(config_path(), new_text)
     actions += report
 
@@ -784,7 +793,7 @@ def sync_for_active_model(active_model: str) -> dict[str, Any]:
     active = (active_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
     if active == LOCAL_DIRECT:
         return restore_local_original()
-    if active == DEFAULT_MODEL:
+    if active in (DEFAULT_MODEL, DEFAULT_CLIENT_MODEL):
         return apply_openai_all()
     if active == DEEPSEEK_POOL:
         return apply_deepseek_pool()

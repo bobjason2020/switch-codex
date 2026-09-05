@@ -1,16 +1,15 @@
     const DEFAULT_MODEL = "openai";
+    const DEFAULT_CLIENT_MODEL = "gpt-6-astra";
     const LOCAL_DIRECT = "local-direct";
     const DEEPSEEK_POOL = "deepseek";
-    const DEEPSEEK_CLIENT_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"];
     const GROK_POOL = "grok";
-    const GROK_CLIENT_MODELS = ["grok-4.6"];
     const PAGE_SIZE = 100;
     const $ = (id) => document.getElementById(id);
     const msg = $("msg");
 
     let knownModels = [DEFAULT_MODEL];
     let knownPools = [DEFAULT_MODEL, DEEPSEEK_POOL];
-    let activeModel = DEFAULT_MODEL;
+    let activeModel = DEFAULT_CLIENT_MODEL;
     let modelCounts = {};
     let modelSync = {};
     let codexStatus = {};
@@ -22,6 +21,7 @@
     let errTotal = 0;
     let pricing = {};
     let pricingModels = [];
+    let defaultModelMaps = {};
 
     function showMsg(text, ok) {
       msg.className = "banner " + (ok ? "ok" : "err");

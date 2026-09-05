@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 import sy
-from sy import auth, core, db, migrate_deepseek, migrate_grok, probes
+from sy import auth, core, db, migrate_astra, migrate_deepseek, migrate_grok, probes
 from sy.api import router as api_router
 from sy.const import STATIC
 from sy.proxy import router as proxy_router
@@ -30,6 +30,7 @@ db.init_db()
 db.migrate_legacy_data()
 migrate_deepseek.migrate()
 migrate_grok.migrate()
+migrate_astra.migrate()
 
 
 @asynccontextmanager
